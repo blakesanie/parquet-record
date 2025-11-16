@@ -1,0 +1,20 @@
+[package]
+name = "parquet-record-derive"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Procedural macro for deriving parquet serialization for structs"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+arrow = { version = "57", features = ["ipc"] }
+parquet = "57"
+bytes = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
