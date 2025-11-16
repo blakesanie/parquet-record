@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Ident, Type, TypePath, Path, PathSegment};
+use syn::{parse_macro_input, DeriveInput, Data, Fields, Ident, Type};
 
 // Define the trait that will be implemented
 #[proc_macro_derive(ParquetSerialize)]
@@ -90,211 +90,235 @@ fn generate_dump_impl(name: &Ident, fields: &[(Option<&Ident>, &Type)]) -> proc_
                     
                     // Generate inline list array construction based on the element type
                     match type_name.as_str() {
-                        "i8" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Int8Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int8, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "i16" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Int16Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int16, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "i32" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Int32Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int32, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "i64" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Int64Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int64, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "u8" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::UInt8Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt8, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "u16" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::UInt16Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt16, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "u32" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::UInt32Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt32, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "u64" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::UInt64Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt64, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "f32" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Float32Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Float32, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "f64" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::Float64Array::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Float64, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "bool" => quote! {
-                            let mut offsets = vec![0i32];
-                            let mut values = Vec::new();
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                values.extend_from_slice(&item.#field_name_ident);
-                            }
-                            
-                            let value_array = ::arrow::array::BooleanArray::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Boolean, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
-                        },
-                        "String" => quote! {
-                            let mut values: Vec<String> = Vec::new();
-                            let mut offsets = vec![0i32];
-                            
-                            let mut current_offset = 0i32;
-                            for item in &items {
-                                current_offset += item.#field_name_ident.len() as i32;
-                                offsets.push(current_offset);
-                                for s in &item.#field_name_ident {
-                                    values.push(s.clone());
+                        "i8" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
                                 }
+                                
+                                let value_array = ::arrow::array::Int8Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int8, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
                             }
-                            
-                            let value_array = ::arrow::array::StringArray::from(values);
-                            let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Utf8, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
-                            
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                        },
+                        "i16" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::Int16Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int16, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "i32" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::Int32Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int32, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "i64" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::Int64Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Int64, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "u8" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::UInt8Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt8, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "u16" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::UInt16Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt16, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "u32" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::UInt32Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt32, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "u64" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::UInt64Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::UInt64, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "f32" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::Float32Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Float32, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "f64" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::Float64Array::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Float64, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "bool" => {
+                            quote! {
+                                let mut offsets = vec![0i32];
+                                let mut values = Vec::new();
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    values.extend_from_slice(&item.#field_name_ident);
+                                }
+                                
+                                let value_array = ::arrow::array::BooleanArray::from(values);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Boolean, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            }
+                        },
+                        "String" => {
+                            quote! {
+                                let mut all_strings: Vec<String> = Vec::new();
+                                let mut offsets = vec![0i32];
+                                
+                                let mut current_offset = 0i32;
+                                for item in &items {
+                                    current_offset += item.#field_name_ident.len() as i32;
+                                    offsets.push(current_offset);
+                                    for s in &item.#field_name_ident {
+                                        all_strings.push(s.clone());
+                                    }
+                                }
+                                
+                                let string_array = ::arrow::array::StringArray::from(all_strings);
+                                let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Utf8, false));
+                                let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
+                                
+                                let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(string_array), None);
+                            }
                         },
                         _ => {
                             return quote! {
@@ -519,7 +543,7 @@ fn generate_dump_impl(name: &Ident, fields: &[(Option<&Ident>, &Type)]) -> proc_
                             let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
                         },
                         "String" => quote! {
-                            let mut values: Vec<String> = Vec::new();
+                            let mut all_strings: Vec<String> = Vec::new();
                             let mut offsets = vec![0i32];
                             
                             let mut current_offset = 0i32;
@@ -528,15 +552,15 @@ fn generate_dump_impl(name: &Ident, fields: &[(Option<&Ident>, &Type)]) -> proc_
                                 current_offset += vec_from_set.len() as i32;
                                 offsets.push(current_offset);
                                 for s in &vec_from_set {
-                                    values.push(s.clone());
+                                    all_strings.push(s.clone());
                                 }
                             }
                             
-                            let value_array = ::arrow::array::StringArray::from(values);
+                            let string_array = ::arrow::array::StringArray::from(all_strings);
                             let field = std::sync::Arc::new(::arrow::datatypes::Field::new("item", ::arrow::datatypes::DataType::Utf8, false));
-                            let offsets = ::arrow::buffer::OffsetBuffer::new((offsets).into());
+                            let offsets = ::arrow::buffer::OffsetBuffer::new(offsets.into());
                             
-                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(value_array), None);
+                            let #field_name_ident = ::arrow::array::ListArray::new(field, offsets, std::sync::Arc::new(string_array), None);
                         },
                         _ => {
                             return quote! {
@@ -555,7 +579,8 @@ fn generate_dump_impl(name: &Ident, fields: &[(Option<&Ident>, &Type)]) -> proc_
                 }
             }
         } else if is_map_type(field_type) {
-            // For map types, serialize to JSON string
+            // For map types, fallback to JSON string for now
+            // The MapArray implementation is complex and has compatibility issues
             quote! {
                 let #field_name_ident: Vec<String> = items.iter().map(|item| ::serde_json::to_string(&item.#field_name_ident).unwrap()).collect();
             }
@@ -1017,9 +1042,7 @@ fn is_map_type(field_type: &Type) -> bool {
     }
 }
 
-fn is_collection_type(field_type: &Type) -> bool {
-    is_vec_type(field_type) || is_hashset_type(field_type) || is_map_type(field_type)
-}
+
 
 fn get_collection_element_type(field_type: &Type) -> Option<&Type> {
     match field_type {
@@ -1075,7 +1098,7 @@ fn rust_type_to_arrow_type(field_type: &Type) -> proc_macro2::TokenStream {
             };
         }
     } else if is_map_type(field_type) {
-        // Map types will remain as JSON strings for now (could be implemented as Map type later)
+        // For now, keep map types as JSON string until we implement proper MapArray support
         return quote! { arrow::datatypes::DataType::Utf8 };
     }
     
@@ -1120,7 +1143,7 @@ fn rust_type_to_arrow_array_type(field_type: &Type) -> proc_macro2::TokenStream 
         // For Vec<T> and HashSet<T>, return ListArray
         return quote! { arrow::array::ListArray };
     } else if is_map_type(field_type) {
-        // Map types remain as StringArray (JSON serialization)
+        // For now, map types remain as StringArray until MapArray is properly implemented
         return quote! { arrow::array::StringArray };
     }
     
@@ -1157,4 +1180,15 @@ fn rust_type_to_arrow_array_type_single(field_type: &Type) -> proc_macro2::Token
             quote! { compile_error!("Unsupported type for parquet serialization. Only primitive types, String, Vec, and HashSet are supported.") }
         }
     }
+}
+
+// Add a practical attribute macro for parquet_flat functionality
+#[proc_macro_attribute] 
+pub fn parquet_flat(_args: TokenStream, input: TokenStream) -> TokenStream {
+    // For a practical implementation, the parquet_flat macro can be used to mark
+    // that the struct contains flattened fields. The actual flattening would be
+    // done by the user defining fields with appropriate prefixed names.
+    // This macro will just return the input unchanged but can be used to indicate
+    // the intent to flatten nested fields.
+    TokenStream::from(input)
 }

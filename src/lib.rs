@@ -3,6 +3,7 @@ use std::sync::Arc;
 use parquet::errors::ParquetError;
 
 pub use parquet_record_derive::ParquetSerialize;
+pub use parquet_record_derive::parquet_flat;
 
 pub trait ParquetSerialize {
     fn dump(items: Vec<Self>) -> Result<Vec<u8>, ParquetError> 
