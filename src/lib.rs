@@ -5,35 +5,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use std::fs::File;
 use std::io::BufWriter;
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::{io};
-use std::sync::mpsc;
-use std::thread;
-
-/// Simple oneshot channel implementation using mpsc
-mod oneshot {
-    use std::sync::mpsc;
-
-    pub struct Sender<T>(mpsc::Sender<T>);
-    pub struct Receiver<T>(mpsc::Receiver<T>);
-
-    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-        let (tx, rx) = mpsc::channel();
-        (Sender(tx), Receiver(rx))
-    }
-
-    impl<T> Sender<T> {
-        pub fn send(self, t: T) -> Result<(), ()> {
-            self.0.send(t).map_err(|_| ())
-        }
-    }
-
-    impl<T> Receiver<T> {
-        pub fn recv(&self) -> Result<T, std::sync::mpsc::RecvError> {
-            self.0.recv()
-        }
-    }
-}
 
 /// Configuration for parquet record operations.
 #[derive(Debug, Clone)]
@@ -80,257 +53,8 @@ pub trait ParquetRecord: Send + Sync {
     fn id_column_name() -> &'static str;
 }
 
-/// A structure to hold a record batch along with its metadata and file path
-#[derive(Debug, Clone)]
-pub struct RecordBatchWithMetadata {
-    pub record_batch: RecordBatch,
-    pub batch_size_bytes: usize,
-    pub file_path: String,  // File path to write to
-}
-
-/// Message to send to the batch write manager
-pub enum ManagerMessage {
-    RecordBatch(RecordBatchWithMetadata),
-    Shutdown(oneshot::Sender<()>),
-}
-
-/// Manager for parquet writing operations that facilitates writes to multiple parquet files
-pub struct BatchWriteManager {
-    sender: mpsc::Sender<ManagerMessage>,
-    pending_bytes: Arc<AtomicUsize>,
-    max_pending_bytes: usize,
-}
-
-/// A handle to manage the batch write manager
-pub struct BatchWriteManagerHandle {
-    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
-}
-
-impl BatchWriteManagerHandle {
-    /// Waits for the batch write manager to complete
-    pub fn join(mut self) -> io::Result<()> {
-        if let Some(handle) = self.handle.take() {
-            handle.join()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Join error: {:?}", e)))?
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl BatchWriteManager {
-    /// Creates a new batch write manager
-    pub fn new(config: ParquetRecordConfig, max_pending_bytes: usize) -> io::Result<(Self, BatchWriteManagerHandle)> {
-        let (sender, receiver) = mpsc::channel::<ManagerMessage>();
-        let pending_bytes = Arc::new(AtomicUsize::new(0));
-        let pending_bytes_clone = pending_bytes.clone();
-
-        let handle = thread::spawn(move || {
-            // Create and run a tokio runtime inside the thread to handle async operations
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Tokio runtime error: {}", e)))?;
-            
-            rt.block_on(async move {
-                use std::collections::HashMap;
-                use tokio::sync::{Mutex as AsyncMutex, mpsc};
-                use tokio::task::JoinHandle;
-
-                // Track active writers for different files - each file gets its own message channel and task
-                let mut file_handlers: HashMap<String, (mpsc::UnboundedSender<RecordBatchWithMetadata>, JoinHandle<Result<(), io::Error>>)> = HashMap::new();
-
-                // We need to bridge the sync receiver to an async context
-                let sync_receiver = Arc::new(Mutex::new(receiver));
-                
-                loop {
-                    // Use spawn_blocking to receive messages from the sync channel
-                    let sync_receiver_clone = sync_receiver.clone();
-                    let message = tokio::task::spawn_blocking(move || {
-                        let receiver = sync_receiver_clone.lock().unwrap();
-                        receiver.recv()
-                    }).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task join error: {}", e)))?;
-                    
-                    let msg = match message {
-                        Ok(m) => m,
-                        Err(_) => break, // Channel disconnected
-                    };
-
-                    match msg {
-                        ManagerMessage::RecordBatch(batch_with_metadata) => {
-                            let file_path = batch_with_metadata.file_path.clone();
-                            let pending_bytes_clone = pending_bytes_clone.clone();
-                            let config_clone = config.clone();
-
-                            // Check if we have a handler for this file, if not create one
-                            if !file_handlers.contains_key(&file_path) {
-                                let (tx, rx) = mpsc::unbounded_channel::<RecordBatchWithMetadata>();
-                                
-                                // Need to clone the initial batch to use its schema for writer creation
-                                let initial_batch = batch_with_metadata.clone();
-                                let file_path_clone = file_path.clone();
-                                
-                                // Create a new async task to handle this specific file
-                                let file_task = tokio::spawn({
-                                    let file_path_clone_task = file_path_clone.clone();
-                                    let pending_bytes_clone_task = pending_bytes_clone.clone();
-                                    let config_clone_task = config_clone.clone();
-                                    let initial_batch_task = initial_batch;
-                                    
-                                    async move {
-                                        // Create file writer for this specific file
-                                        let file = File::create(&file_path_clone_task)
-                                            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("File creation error: {}", e)))?;
-                                        let buf_writer = BufWriter::new(file);
-
-                                        let mut writer = ArrowWriter::try_new(buf_writer, initial_batch_task.record_batch.schema(), None)
-                                            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ArrowWriter creation error: {}", e)))?;
-
-                                        // Process all batches for this file
-                                        let mut rx = rx;
-                                        while let Some(batch_with_metadata) = rx.recv().await {
-                                            writer
-                                                .write(&batch_with_metadata.record_batch)
-                                                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e)))?;
-
-                                            // Update pending bytes after writing (subtract from pending)
-                                            let new_pending = pending_bytes_clone_task.load(Ordering::Relaxed).saturating_sub(batch_with_metadata.batch_size_bytes);
-                                            pending_bytes_clone_task.store(new_pending, Ordering::Relaxed);
-
-                                            if config_clone_task.verbose {
-                                                let batch_size_mb = batch_with_metadata.batch_size_bytes as f64 / (1024.0 * 1024.0);
-                                                let pending_bytes_mb = pending_bytes_clone_task.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
-                                                println!(
-                                                    "{} FLUSHED BATCH (~{:.2} MB in memory) to Parquet, ~{:.2} MB still pending",
-                                                    file_path_clone_task,
-                                                    batch_size_mb,
-                                                    pending_bytes_mb,
-                                                );
-                                            }
-                                        }
-
-                                        // Close the writer when done
-                                        writer.close()
-                                            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Writer close error: {}", e)))?;
-
-                                        Ok(())
-                                    }
-                                });
-                                
-                                file_handlers.insert(file_path_clone, (tx, file_task));
-                            }
-
-                            // Get the sender for this file and send the batch
-                            if let Some((sender, _)) = file_handlers.get(&file_path) {
-                                // Update pending bytes before sending (add to pending)
-                                pending_bytes_clone.fetch_add(batch_with_metadata.batch_size_bytes, Ordering::Relaxed);
-                                
-                                if let Err(_) = sender.send(batch_with_metadata) {
-                                    return Err(io::Error::new(io::ErrorKind::Other, "Failed to send batch to file handler"));
-                                }
-                            }
-                        },
-                        ManagerMessage::Shutdown(response_sender) => {
-                            // Close all file handlers by dropping senders
-                            for (tx, _handle) in file_handlers.values() {
-                                // Dropping the sender will close the receiving end of the channel
-                                drop(tx.clone());
-                            }
-
-                            // Wait for all active file tasks to complete
-                            let handles: Vec<JoinHandle<Result<(), io::Error>>> = file_handlers.drain().map(|(_, (_, handle))| handle).collect();
-                            for handle in handles {
-                                if let Err(e) = handle.await {
-                                    eprintln!("Error awaiting file task: {}", e);
-                                }
-                            }
-
-                            // Respond to shutdown request
-                            let _ = response_sender.send(());
-                            break;
-                        }
-                    }
-                }
-                
-                if config.verbose {
-                    println!("[BatchWriteManager] Finished writing to all files");
-                }
-                
-                Ok(())
-            })
-        });
-        
-        let manager_handle = BatchWriteManagerHandle {
-            handle: Some(handle),
-        };
-        
-        let manager = Self { 
-            sender, 
-            pending_bytes,
-            max_pending_bytes,
-        };
-        
-        Ok((manager, manager_handle))
-    }
-    
-    /// Sends a record batch to be written to the specified file
-    /// This method will block if there are too many pending writes
-    /// Sends a record batch to be written to its designated file
-    /// This method will block if there are too many pending writes
-    pub fn send_record_batch(&self, batch_with_metadata: RecordBatchWithMetadata) -> Result<(), io::Error> {
-        let buffer_size = batch_with_metadata.batch_size_bytes;
-
-        // Wait until there's enough space for the buffer
-        loop {
-            let current_pending = self.pending_bytes.load(Ordering::Relaxed);
-            if current_pending + buffer_size <= self.max_pending_bytes {
-                // There's enough space, add to pending and send
-                self.pending_bytes.fetch_add(buffer_size, Ordering::Relaxed);
-                break;
-            }
-
-            // Brief pause to wait for more space to free up
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
-        self.sender.send(ManagerMessage::RecordBatch(batch_with_metadata))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send record batch to batch write manager"))
-    }
-
-    /// Sends a record batch to be written to the specified file
-    /// This method will block if there are too many pending writes
-    pub fn send_record_batch_to_file(&self, batch_with_metadata: RecordBatchWithMetadata) -> Result<(), io::Error> {
-        let buffer_size = batch_with_metadata.batch_size_bytes;
-
-        // Wait until there's enough space for the buffer
-        loop {
-            let current_pending = self.pending_bytes.load(Ordering::Relaxed);
-            if current_pending + buffer_size <= self.max_pending_bytes {
-                // There's enough space, add to pending and send
-                self.pending_bytes.fetch_add(buffer_size, Ordering::Relaxed);
-                break;
-            }
-
-            // Brief pause to wait for more space to free up
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
-        self.sender.send(ManagerMessage::RecordBatch(batch_with_metadata))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send record batch to batch write manager"))
-    }
-
-    /// Shuts down the manager
-    pub fn shutdown(&self) -> Result<(), io::Error> {
-        let (response_tx, _response_rx) = oneshot::channel();
-
-        self.sender.send(ManagerMessage::Shutdown(response_tx))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send shutdown message"))?;
-
-        // We don't wait here since it would block - the shutdown happens asynchronously
-        Ok(())
-    }
-}
-
-/// A buffer of items that can be sent to the batch write manager
+/// A buffer of items that can be processed
+#[derive(Debug)]
 pub struct BatchBuffer<T: ParquetRecord> {
     pub items: Vec<T>,      // Unconverted items
 }
@@ -347,51 +71,88 @@ impl<T: ParquetRecord> BatchBuffer<T> {
     }
 }
 
-/// A batch writer that maintains a buffer under a mutex and sends it to the batch write manager when full
+/// A batch writer that maintains a primary buffer protected by a mutex.
+/// When the buffer is full, it's swapped with a secondary buffer and written to disk 
+/// on the same calling thread, while the primary buffer remains available for other threads.
+
+#[derive(Debug)]
 pub struct ParquetBatchWriter<T: ParquetRecord> {
-    buffer: Arc<Mutex<BatchBuffer<T>>>,
-    manager: Arc<BatchWriteManager>,
-    output_file: String,  // The file this batch writer writes to
+    buffer: Mutex<BatchBuffer<T>>,
     buffer_size: usize,
+    file_writer: Mutex<ArrowWriter<BufWriter<File>>>, // Writer is created when first batch is processed
+    schema: Arc<Schema>, // Store the schema to avoid calling T::schema() repeatedly
+    output_file: String,
+    _config: ParquetRecordConfig,
 }
 
 impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
     /// Creates a new batch writer for a specific output file
-    pub fn new(manager: Arc<BatchWriteManager>, output_file: String, buffer_size: usize) -> Self {
-        let buffer = Arc::new(Mutex::new(BatchBuffer::new(buffer_size)));
+    pub fn new(output_file: String, buffer_size: usize) -> Self {
+        Self::with_config(output_file, buffer_size, ParquetRecordConfig::default())
+    }
 
+    pub fn with_config(output_file: String, buffer_size: usize, config: ParquetRecordConfig) -> Self {
+        let buffer = Mutex::new(BatchBuffer::new(buffer_size));
+        let schema = T::schema();
+        let file = File::create(&output_file).unwrap_or_else(|e| panic!("could not create file {}: {}", output_file, e));
+        let buf_writer = BufWriter::new(file);
+
+        let file_writer = Mutex::new(ArrowWriter::try_new(buf_writer, schema.clone(), None).unwrap());
+        if config.verbose {
+            println!("Created parquet batch writer for {}", output_file);
+        }
         Self {
             buffer,
-            manager,
-            output_file,
             buffer_size,
+            file_writer,
+            schema,
+            output_file,
+            _config: config,
         }
     }
 
     /// Adds a batch of items to the buffer. If the buffer exceeds the specified size,
-    /// it will be transferred to the batch write manager.
+    /// it will be swapped with a secondary buffer and written to disk on the same thread.
     pub fn add_item_batch(&self, items: Vec<T>) -> Result<(), io::Error> {
         let mut buffer_guard = self.buffer.lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
 
         buffer_guard.items.extend(items);
 
-        // Check if buffer needs to be flushed
+        // Check if buffer needs to be flushed to disk
         if buffer_guard.items.len() >= self.buffer_size {
-            let mut full_buffer = BatchBuffer::new(buffer_guard.items.len());
-            std::mem::swap(&mut *buffer_guard, &mut full_buffer);
+            let writer_guard = self.file_writer.lock();
+            let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
+            std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
-            // Unlock before converting and sending to manager to avoid blocking
+            // Unlock the primary buffer immediately so other threads can continue
             drop(buffer_guard);
 
-            // Convert to RecordBatch before sending to manager
-            self.send_buffer_to_manager(full_buffer)?;
+            // Write the secondary buffer to disk on the same thread
+            self.write_buffer_to_disk(writer_guard, secondary_buffer)?;
         }
 
         Ok(())
     }
 
-    /// Flushes the current buffer to the batch write manager
+    /// Write the buffer to disk (this happens on the same thread as the caller)
+    fn write_buffer_to_disk(&self, writer_guard:  LockResult<MutexGuard<ArrowWriter<BufWriter<File>>>>, buffer: BatchBuffer<T>) -> Result<(), io::Error> {
+        if buffer.items.is_empty() {
+            return Ok(());
+        }
+            // For subsequent batches, convert and write them
+            let record_batch = T::dump_record_batch(self.schema.clone(), &buffer.items);
+        if self._config.verbose {
+            println!("{} Flushed {} records ~{} MB", self.output_file, record_batch.num_rows(), record_batch.get_array_memory_size() / 1024 / 1024);
+        }
+        writer_guard.unwrap().write(&record_batch)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e)))?;
+
+
+        Ok(())
+    }
+
+    /// Flushes the current buffer to disk
     pub fn flush(&self) -> Result<(), io::Error> {
         let mut buffer_guard = self.buffer.lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
@@ -399,38 +160,15 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
         if buffer_guard.items.is_empty() {
             return Ok(());
         }
+        let writer_guard = self.file_writer.lock();
+        let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
+        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
-        let mut full_buffer = BatchBuffer::new(buffer_guard.items.len());
-        std::mem::swap(&mut *buffer_guard, &mut full_buffer);
-
-        // Unlock before converting and sending to manager to avoid blocking
+        // Unlock the primary buffer immediately so other threads can continue
         drop(buffer_guard);
 
-        self.send_buffer_to_manager(full_buffer)
-    }
-
-    /// Converts buffer to RecordBatch and sends to manager
-    fn send_buffer_to_manager(&self, buffer: BatchBuffer<T>) -> Result<(), io::Error> {
-        if buffer.items.is_empty() {
-            return Ok(());
-        }
-
-        // Convert items to RecordBatch (this is the expensive operation that happens right before sending to manager)
-        let schema = T::schema();
-        let record_batch = T::dump_record_batch(schema, &buffer.items);
-
-        // Calculate batch size for tracking
-        let batch_size_bytes = record_batch.get_array_memory_size();
-
-        let batch_with_metadata = RecordBatchWithMetadata {
-            record_batch,
-            batch_size_bytes,
-            file_path: self.output_file.clone(),
-        };
-
-        self.manager.send_record_batch_to_file(batch_with_metadata)?;
-
-        Ok(())
+        // Write the secondary buffer to disk on the same thread
+        self.write_buffer_to_disk(writer_guard, secondary_buffer)
     }
 
     /// Gets the number of items currently in the buffer
@@ -439,6 +177,21 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
             Ok(guard) => guard.items.len(),
             Err(_) => 0,
         }
+    }
+
+    /// Closes the writer and finalizes the file
+    pub fn close(self) -> Result<(), io::Error> {
+        if self._config.verbose {
+            println!("{} flushing remaining items", self.output_file);
+        }
+        self.flush()?;
+
+        let x = self.file_writer.into_inner().unwrap();
+        x.close().expect("Could not close parquet writer");
+        if self._config.verbose {
+            println!("{} closed writer", self.output_file);
+        }
+        Ok(())
     }
 }
 
@@ -718,11 +471,10 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_write_manager_sync() {
-        let config = ParquetRecordConfig::silent();
-        let (manager, handle) = BatchWriteManager::new(config, 1024 * 1024).unwrap(); // 1MB max pending
-
-        // Create a test record batch
+    fn test_parquet_batch_writer() {
+        let mut writer = ParquetBatchWriter::<TestRecord>::new("test_output.parquet".to_string(), 2);
+        
+        // Create test items
         let test_items = vec![
             TestRecord {
                 id: 1,
@@ -734,35 +486,14 @@ mod tests {
             },
         ];
 
-        let schema = TestRecord::schema();
-        let record_batch = TestRecord::dump_record_batch(schema, &test_items);
-        let batch_size = record_batch.get_array_memory_size();
-
-        let batch_with_metadata = RecordBatchWithMetadata {
-            record_batch,
-            batch_size_bytes: batch_size,
-            file_path: "test_output.parquet".to_string(),
-        };
-
-        // Send batch to manager
-        manager.send_record_batch(batch_with_metadata).unwrap();
-
-        // Shutdown and join (this will now block until complete)
-        manager.shutdown().unwrap();
-        handle.join().unwrap(); // This should now be blocking, not async!
+        // Add items to writer
+        writer.add_item_batch(test_items).unwrap();
+        
+        // Close the writer to finalize the file
+        writer.close().unwrap();
 
         // Clean up test file
         use std::fs;
         let _ = fs::remove_file("test_output.parquet");
-    }
-
-    #[test]
-    fn test_batch_write_manager_handle_join_is_blocking() {
-        let config = ParquetRecordConfig::silent();
-        let (manager, handle) = BatchWriteManager::new(config, 1024 * 1024).unwrap();
-
-        // Shutdown and join (this will now block until complete)
-        manager.shutdown().unwrap();
-        handle.join().unwrap(); // This demonstrates that join() is now blocking, not async
     }
 }
