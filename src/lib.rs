@@ -5,7 +5,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use std::fs::File;
 use std::io::BufWriter;
-use std::sync::{Arc, LockResult, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::{io};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
@@ -75,12 +75,13 @@ impl<T: ParquetRecord> BatchBuffer<T> {
 /// A batch writer that maintains a primary buffer protected by a mutex.
 /// When the buffer is full, it's swapped with a secondary buffer and written to disk 
 /// on the same calling thread, while the primary buffer remains available for other threads.
+/// The file and writers are created lazily on first use, only when there's actual data to write.
 
 #[derive(Debug)]
 pub struct ParquetBatchWriter<T: ParquetRecord> {
     buffer: Mutex<BatchBuffer<T>>,
     buffer_size: usize,
-    file_writer: Mutex<ArrowWriter<BufWriter<File>>>, // Writer is created when first batch is processed
+    file_writer: Mutex<Option<ArrowWriter<BufWriter<File>>>>, // Writer is created lazily on first write
     schema: Arc<Schema>, // Store the schema to avoid calling T::schema() repeatedly
     output_file: String,
     _config: ParquetRecordConfig,
@@ -93,20 +94,11 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
     }
 
     pub fn with_config(output_file: String, buffer_size: usize, config: ParquetRecordConfig) -> Self {
-        let buffer = Mutex::new(BatchBuffer::new(buffer_size));
-        let schema = T::schema();
-        let file = File::create(&output_file).unwrap_or_else(|e| panic!("could not create file {}: {}", output_file, e));
-        let buf_writer = BufWriter::new(file);
-
-        let file_writer = Mutex::new(ArrowWriter::try_new(buf_writer, schema.clone(), None).unwrap());
-        if config.verbose {
-            println!("Created parquet batch writer for {}", output_file);
-        }
         Self {
-            buffer,
+            buffer: Mutex::new(BatchBuffer::new(buffer_size)),
             buffer_size,
-            file_writer,
-            schema,
+            file_writer: Mutex::new(None), // Initially None - no file operations yet
+            schema: T::schema(),
             output_file,
             _config: config,
         }
@@ -122,33 +114,58 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
 
         // Check if buffer needs to be flushed to disk
         if buffer_guard.items.len() >= self.buffer_size {
-            let writer_guard = self.file_writer.lock();
+            // Swap with secondary buffer
             let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
             std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
-            // Unlock the primary buffer immediately so other threads can continue
+            // Unlock primary buffer immediately
             drop(buffer_guard);
 
-            // Write the secondary buffer to disk on the same thread
-            self.write_buffer_to_disk(writer_guard, secondary_buffer)?;
+            // The actual file operations happen here - only when we know there's data to write
+            self.write_buffer_to_disk(secondary_buffer)?;
         }
 
         Ok(())
     }
 
     /// Write the buffer to disk (this happens on the same thread as the caller)
-    fn write_buffer_to_disk(&self, writer_guard:  LockResult<MutexGuard<ArrowWriter<BufWriter<File>>>>, buffer: BatchBuffer<T>) -> Result<(), io::Error> {
+    /// This function also handles lazy initialization of file and writer on first use
+    fn write_buffer_to_disk(&self, buffer: BatchBuffer<T>) -> Result<(), io::Error> {
         if buffer.items.is_empty() {
             return Ok(());
         }
-            // For subsequent batches, convert and write them
-            let record_batch = T::dump_record_batch(self.schema.clone(), &buffer.items);
-        if self._config.verbose {
-            println!("{} Flushed {} records ~{} MB", self.output_file, record_batch.num_rows(), record_batch.get_array_memory_size() / 1024 / 1024);
-        }
-        writer_guard.unwrap().write(&record_batch)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e)))?;
 
+        // This is the first function that knows there's actually data to write,
+        // so it's where we do all the lazy initialization
+        let mut writer_guard = self.file_writer.lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
+
+        // Lazy initialization: create file, buf_writer, and arrow_writer only when data arrives
+        if writer_guard.is_none() {
+            // Now we know we need to create the file - do all the expensive operations here
+            let file = File::create(&self.output_file)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("File creation error: {}", e)))?;
+            let buf_writer = BufWriter::new(file);  // Create BufWriter
+            
+            // Convert the buffer to a record batch to get the initial schema/data
+            let record_batch = T::dump_record_batch(self.schema.clone(), &buffer.items);
+            
+            // Create the ArrowWriter with the file and schema
+            let mut writer = ArrowWriter::try_new(buf_writer, record_batch.schema(), None)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ArrowWriter creation error: {}", e)))?;
+            
+            // Write the first batch immediately
+            writer.write(&record_batch)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Initial write error: {}", e)))?;
+            
+            // Store the writer for future use
+            *writer_guard = Some(writer);
+        } else if let Some(ref mut writer) = *writer_guard {
+            // For subsequent writes, just write the data
+            let record_batch = T::dump_record_batch(self.schema.clone(), &buffer.items);
+            writer.write(&record_batch)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -161,15 +178,15 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
         if buffer_guard.items.is_empty() {
             return Ok(());
         }
-        let writer_guard = self.file_writer.lock();
+
         let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
         std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
         // Unlock the primary buffer immediately so other threads can continue
         drop(buffer_guard);
 
-        // Write the secondary buffer to disk on the same thread
-        self.write_buffer_to_disk(writer_guard, secondary_buffer)
+        // Write the secondary buffer to disk
+        self.write_buffer_to_disk(secondary_buffer)
     }
 
     /// Gets the number of items currently in the buffer
@@ -182,16 +199,21 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
 
     /// Closes the writer and finalizes the file
     pub fn close(self) -> Result<(), io::Error> {
-        if self._config.verbose {
-            println!("{} flushing remaining items", self.output_file);
-        }
+        // Flush any remaining items
         self.flush()?;
 
-        let x = self.file_writer.into_inner().unwrap();
-        x.close().expect("Could not close parquet writer");
-        if self._config.verbose {
-            println!("{} closed writer", self.output_file);
+        // Close the writer if it was created
+        let maybe_writer = {
+            let mut writer_guard = self.file_writer.lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
+            writer_guard.take() // This removes the writer from the option
+        };
+
+        if let Some(mut writer) = maybe_writer {
+            writer.close()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Writer close error: {}", e)))?;
         }
+
         Ok(())
     }
 }
@@ -296,7 +318,7 @@ pub fn read_id_batches_with_config<T, I>(
 ) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
 where
     T: ParquetRecord + Send + 'static,
-    I: ArrowPrimitiveType
+    I: ArrowPrimitiveType,
 {
     // 1. Open the file
     let file = match File::open(file_path) {
@@ -477,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_parquet_batch_writer() {
-        let mut writer = ParquetBatchWriter::<TestRecord>::new("test_output.parquet".to_string(), 2);
+        let writer = ParquetBatchWriter::<TestRecord>::new("test_output.parquet".to_string(), 2);
         
         // Create test items
         let test_items = vec![
@@ -491,7 +513,7 @@ mod tests {
             },
         ];
 
-        // Add items to writer
+        // Add items to writer (this triggers file creation)
         writer.add_item_batch(test_items).unwrap();
         
         // Close the writer to finalize the file
