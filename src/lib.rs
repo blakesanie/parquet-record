@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::{io};
+use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
 /// Configuration for parquet record operations.
 #[derive(Debug, Clone)]
@@ -212,7 +213,6 @@ where
         Ok(f) => f,
         // If file open fails, we return an iterator that yields one error and stops.
         Err(e) => {
-            eprintln!("[ParquetRecord] Cannot open file {}: {}", file_path, e);
             return None;
         }
     };
@@ -288,14 +288,15 @@ where
 /// Read only ID batches with the provided configuration.
 /// This function efficiently reads only the ID column from parquet files, which is faster
 /// because only the ID column needs to be scanned.
-pub fn read_id_batches_with_config<T>(
+pub fn read_id_batches_with_config<T, I>(
     _schema: Arc<Schema>,
     file_path: &str,
     batch_size: usize,
     _config: &ParquetRecordConfig,
-) -> Option<impl Iterator<Item = Vec<i32>>>
+) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
 where
     T: ParquetRecord + Send + 'static,
+    I: ArrowPrimitiveType
 {
     // 1. Open the file
     let file = match File::open(file_path) {
@@ -362,20 +363,23 @@ where
             Ok(record_batch) => {
                 // Extract the ID column from the record batch
                 let id_array = record_batch.column_by_name(&id_column_name)?;
-                let id_values = as_primitive_array::<arrow::datatypes::Int32Type>(id_array);
                 
-                let mut id_vec = Vec::with_capacity(id_values.len());
-                for i in 0..id_values.len() {
-                    if id_values.is_null(i) {
-                        // Handle null values - in this case we'll skip them
-                        continue;
-                    } else {
-                        id_vec.push(id_values.value(i));
+                // Attempt to cast to the expected primitive array type
+                if let Some(id_values) = id_array.as_any().downcast_ref::<arrow::array::PrimitiveArray<I>>() {
+                    let mut id_vec = Vec::with_capacity(id_values.len());
+                    for i in 0..id_values.len() {
+                        if !id_values.is_null(i) {
+                            id_vec.push(id_values.value(i));
+                        }
                     }
-                }
 
-                // Return the vector of ID values
-                Some(id_vec)
+                    // Return the vector of ID values
+                    Some(id_vec)
+                } else {
+                    // Type mismatch - could not cast to expected type
+                    *errored = true;
+                    None
+                }
             }
             // Case B: Parquet I/O read error
             Err(e) => {
@@ -395,15 +399,16 @@ where
 }
 
 /// Read only ID batches with default configuration (verbose enabled).
-pub fn read_id_batches<T>(
+pub fn read_id_batches<T, I>(
     schema: Arc<Schema>,
     file_path: &str,
     batch_size: usize,
-) -> Option<impl Iterator<Item = Vec<i32>>>
+) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
 where
     T: ParquetRecord + Send + 'static,
+    I: ArrowPrimitiveType,
 {
-    read_id_batches_with_config::<T>(schema, file_path, batch_size, &ParquetRecordConfig::default())
+    read_id_batches_with_config::<T, I>(schema, file_path, batch_size, &ParquetRecordConfig::default())
 }
 
 #[cfg(test)]
