@@ -5,7 +5,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use std::fs::File;
 use std::io::BufWriter;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
@@ -112,7 +112,10 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
 
         buffer_guard.items.extend(items);
 
-        // Check if buffer needs to be flushed to disk
+        self.check_for_buffer_overflow(buffer_guard)
+    }
+
+    fn check_for_buffer_overflow(&self, mut buffer_guard: MutexGuard<BatchBuffer<T>>) -> Result<(), io::Error> {
         if buffer_guard.items.len() >= self.buffer_size {
             // Swap with secondary buffer
             let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
@@ -124,8 +127,16 @@ impl<T: ParquetRecord + 'static> ParquetBatchWriter<T> {
             // The actual file operations happen here - only when we know there's data to write
             self.write_buffer_to_disk(secondary_buffer)?;
         }
-
         Ok(())
+    }
+
+    pub fn add_item(&self, item: T) -> Result<(), io::Error> {
+        let mut buffer_guard = self.buffer.lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+
+        buffer_guard.items.push(item);
+
+        self.check_for_buffer_overflow(buffer_guard)
     }
 
     /// Write the buffer to disk (this happens on the same thread as the caller)
