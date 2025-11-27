@@ -318,17 +318,16 @@ where
     read_batches_with_config(schema, file_path, batch_size, &ParquetRecordConfig::default())
 }
 
-/// Read only ID batches with the provided configuration.
-/// This function efficiently reads only the ID column from parquet files, which is faster
-/// because only the ID column needs to be scanned.
-pub fn read_id_batches_with_config<T, I>(
-    _schema: Arc<Schema>,
+/// Read only specified column batches with the provided configuration.
+/// This function efficiently reads only the specified column from parquet files, which is faster
+/// because only the specified column needs to be scanned.
+pub fn read_col_batches_with_config<I>(
     file_path: &str,
+    column_name: &str,
     batch_size: usize,
     _config: &ParquetRecordConfig,
 ) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
 where
-    T: ParquetRecord + Send + 'static,
     I: ArrowPrimitiveType,
 {
     // 1. Open the file
@@ -341,25 +340,23 @@ where
         }
     };
 
-    // 2. Create the ParquetRecordBatchReader with column projection to read only the ID column
-    let id_column_name = T::id_column_name();
-    
+    // 2. Create the ParquetRecordBatchReader with column projection to read only the specified column
     let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[ParquetRecordIDReader] Cannot create ParquetRecordBatchReaderBuilder: {}", e);
+            eprintln!("[ParquetRecordColReader] Cannot create ParquetRecordBatchReaderBuilder: {}", e);
             return None;
         }
     };
 
-    // Project to read only the ID column
+    // Project to read only the specified column
     let column_indices: Vec<usize> = builder
         .parquet_schema()
         .columns()
         .iter()
         .enumerate()
         .filter_map(|(i, col)| {
-            if col.name() == id_column_name {
+            if col.name() == column_name {
                 Some(i)
             } else {
                 None
@@ -368,7 +365,7 @@ where
         .collect();
 
     if column_indices.is_empty() {
-        eprintln!("[ParquetRecordIDReader] ID column '{}' not found in parquet file schema", id_column_name);
+        eprintln!("[ParquetRecordColReader] Column '{}' not found in parquet file schema", column_name);
         return None;
     }
 
@@ -379,12 +376,12 @@ where
     let reader = match builder.with_batch_size(batch_size).build() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[ParquetRecordIDReader] Cannot build ParquetRecordBatchReader: {}", e);
+            eprintln!("[ParquetRecordColReader] Cannot build ParquetRecordBatchReader: {}", e);
             return None;
         }
     };
 
-    let id_column_name = T::id_column_name().to_string();
+    let col_name = column_name.to_string();
     let scanned_iterator = reader.scan(false, move |errored, record_batch_result| {
         // 1. Check for previous error
         if *errored {
@@ -394,20 +391,20 @@ where
         match record_batch_result {
             // Case A: Successful Arrow RecordBatch read
             Ok(record_batch) => {
-                // Extract the ID column from the record batch
-                let id_array = record_batch.column_by_name(&id_column_name)?;
+                // Extract the specified column from the record batch
+                let col_array = record_batch.column_by_name(&col_name)?;
                 
                 // Attempt to cast to the expected primitive array type
-                if let Some(id_values) = id_array.as_any().downcast_ref::<arrow::array::PrimitiveArray<I>>() {
-                    let mut id_vec = Vec::with_capacity(id_values.len());
-                    for i in 0..id_values.len() {
-                        if !id_values.is_null(i) {
-                            id_vec.push(id_values.value(i));
+                if let Some(values) = col_array.as_any().downcast_ref::<arrow::array::PrimitiveArray<I>>() {
+                    let mut col_vec = Vec::with_capacity(values.len());
+                    for i in 0..values.len() {
+                        if !values.is_null(i) {
+                            col_vec.push(values.value(i));
                         }
                     }
 
-                    // Return the vector of ID values
-                    Some(id_vec)
+                    // Return the vector of column values
+                    Some(col_vec)
                 } else {
                     // Type mismatch - could not cast to expected type
                     *errored = true;
@@ -418,7 +415,7 @@ where
             Err(e) => {
                 // I/O error: Log, set state to stop, and return None.
                 eprintln!(
-                    "[ParquetIDReader] Parquet read error, stopping iteration: {}",
+                    "[ParquetColReader] Parquet read error, stopping iteration: {}",
                     e
                 );
                 *errored = true;
@@ -431,17 +428,16 @@ where
     Some(scanned_iterator)
 }
 
-/// Read only ID batches with default configuration (verbose enabled).
-pub fn read_id_batches<T, I>(
-    schema: Arc<Schema>,
+/// Read only specified column batches with default configuration (verbose enabled).
+pub fn read_col_batches<I>(
     file_path: &str,
+    column_name: &str,
     batch_size: usize,
 ) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
 where
-    T: ParquetRecord + Send + 'static,
     I: ArrowPrimitiveType,
 {
-    read_id_batches_with_config::<T, I>(schema, file_path, batch_size, &ParquetRecordConfig::default())
+    read_col_batches_with_config::<I>(file_path, column_name, batch_size, &ParquetRecordConfig::default())
 }
 
 #[cfg(test)]
