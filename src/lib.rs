@@ -1,6 +1,7 @@
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::Schema;
+use crossbeam_channel::{Sender, Receiver};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
@@ -87,15 +88,20 @@ pub struct WriteStats {
     pub total_bytes_written: usize,
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 #[derive(Debug)]
 pub struct ParquetBatchWriter<T: ParquetRecord> {
     buffer: Mutex<BatchBuffer<T>>,
     buffer_size: usize,
-    file_writer: Mutex<Option<ArrowWriter<BufWriter<File>>>>, // Writer is created lazily on first write
+    write_sender: Sender<(RecordBatch, usize)>, // Channel to send data to the write thread
     schema: Arc<Schema>, // Store the schema to avoid calling T::schema() repeatedly
     output_file: String,
     config: ParquetRecordConfig,
     stats: Mutex<WriteStats>,
+    closed: AtomicBool,
+    // Hold the join handle to ensure the write thread finishes properly
+    _write_thread_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
@@ -117,6 +123,7 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             output_file,
             config,
             stats: Mutex::new(WriteStats::default()),
+            closed: Mutex::new(false),
         }
     }
 
@@ -231,7 +238,9 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
 
         // Convert the buffer to a record batch to get the initial schema/data
+        let buffer_count = buffer.items.len();
         let record_batch = T::items_to_records(self.schema.clone(), &buffer.items);
+        drop(buffer);
 
         // Get the size of the record batch before writing for logging purposes
         let batch_size_bytes = self.calculate_batch_size(&record_batch);
@@ -239,6 +248,11 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
         // Lazy initialization: create file, buf_writer, and arrow_writer only when data arrives
         if writer_guard.is_none() {
             // Now we know we need to create the file - do all the expensive operations here
+            // Create parent directories if they don't exist
+            if let Some(parent) = std::path::Path::new(&self.output_file).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            
             let file = File::create(&self.output_file).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("File creation error: {}", e))
             })?;
@@ -273,7 +287,7 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
 
-        stats_guard.total_items_written += buffer.items.len();
+        stats_guard.total_items_written += buffer_count;
         stats_guard.total_batches_written += 1;
         stats_guard.total_bytes_written += batch_size_bytes;
 
@@ -282,9 +296,9 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             let total_mb_written =
                 (stats_guard.total_bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
             println!(
-                "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}/{}) Total: {} MB",
+                "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}) Total items: {} / {} MB",
                 self.output_file,
-                buffer.items.len(),
+                buffer_count,
                 mb_written,
                 stats_guard.total_batches_written,
                 stats_guard.total_items_written,
@@ -327,6 +341,17 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
 
     /// Closes the writer and finalizes the file
     pub fn close(self) -> Result<(), io::Error> {
+        self.close_no_consume()
+    }
+
+    pub fn close_no_consume(&self) -> Result<(), io::Error> {
+        let mut closed_guard = self.closed.lock().unwrap();
+        if *closed_guard == true {
+            return Ok(());
+        }
+        *closed_guard = true;
+        drop(closed_guard);
+
         // Flush any remaining items
         self.flush()?;
 
