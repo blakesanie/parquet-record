@@ -54,10 +54,6 @@ pub trait ParquetRecord: Send + Sync {
     fn records_to_items(record_batch: &RecordBatch) -> io::Result<Vec<Self>>
     where
         Self: Sized;
-
-    /// Returns the name of the ID column in the schema.
-    /// This is used by read_id_batches to efficiently read only the ID column.
-    fn id_column_name() -> &'static str;
 }
 
 /// A buffer of items that can be processed
@@ -399,7 +395,7 @@ pub fn read_parquet_with_config<T>(
     _config: &ParquetRecordConfig,
 ) -> Option<impl Iterator<Item = Vec<T>>>
 where
-    T: ParquetRecord + Send + 'static,
+    T: ParquetRecord,
 {
     // 1. Open the file
     let file = match File::open(file_path) {
@@ -477,7 +473,7 @@ pub fn read_parquet<T>(
     batch_size: Option<usize>,
 ) -> Option<impl Iterator<Item = Vec<T>>>
 where
-    T: ParquetRecord + Send + 'static,
+    T: ParquetRecord,
 {
     read_parquet_with_config(
         schema,
@@ -637,7 +633,7 @@ pub fn read_parquet_columns_with_config_par<I>(
     _config: &ParquetRecordConfig,
 ) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
 where
-    I: ArrowPrimitiveType + Send + Sync + 'static,
+    I: ArrowPrimitiveType + Send + Sync,
 {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use rayon::prelude::*;
@@ -703,7 +699,7 @@ pub fn read_parquet_columns_par<I>(
     batch_size: Option<usize>,
 ) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
 where
-    I: ParquetRecord + Send + 'static + arrow::array::ArrowPrimitiveType,
+    I: ArrowPrimitiveType + Sync + Send,
 {
     read_parquet_columns_with_config_par::<I>(
         file_path,
@@ -723,7 +719,7 @@ pub fn read_parquet_with_config_par<T>(
     _config: &ParquetRecordConfig,
 ) -> Option<impl ParallelIterator<Item = Vec<T>>>
 where
-    T: ParquetRecord + Send + 'static,
+    T: ParquetRecord + 'static,
 {
     let file = File::open(file_path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
@@ -744,12 +740,12 @@ where
     )
 }
 
-pub struct RowGroupReader<T: ParquetRecord + Send + 'static> {
+pub struct RowGroupReader<T: ParquetRecord> {
     reader: ParquetRecordBatchReader,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: ParquetRecord + Send + 'static> RowGroupReader<T> {
+impl<T: ParquetRecord> RowGroupReader<T> {
     pub fn new(row_group_idx: usize, file_path: &str, batch_size: Option<usize>) -> Option<Self> {
         let file = File::open(file_path).ok()?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
@@ -771,7 +767,7 @@ impl<T: ParquetRecord + Send + 'static> RowGroupReader<T> {
     }
 }
 
-impl<T: ParquetRecord + Send + 'static> ParallelIterator for RowGroupReader<T> {
+impl<T: ParquetRecord> ParallelIterator for RowGroupReader<T> {
     type Item = Vec<T>;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
@@ -807,7 +803,7 @@ pub fn read_parquet_par<T>(
     batch_size: Option<usize>,
 ) -> Option<impl ParallelIterator<Item = Vec<T>>>
 where
-    T: ParquetRecord + Send + 'static,
+    T: ParquetRecord + 'static,
 {
     read_parquet_with_config_par(
         schema,
@@ -876,9 +872,6 @@ mod tests {
             Ok(result)
         }
 
-        fn id_column_name() -> &'static str {
-            "id"
-        }
     }
 
     #[test]
@@ -969,7 +962,8 @@ mod tests {
         let results = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(10));
         assert!(results.is_some());
 
-        let all_ids: Vec<i32> = results.unwrap().into_iter().flatten().collect();
+        let unwrapped_results = results.unwrap();
+        let all_ids: Vec<i32> = unwrapped_results.into_par_iter().flatten().collect();
         assert_eq!(all_ids.len(), 3);
         assert!(all_ids.contains(&1));
         assert!(all_ids.contains(&2));
@@ -978,5 +972,400 @@ mod tests {
         // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_all_functions_comprehensive() {
+        // Create test data
+        let path = "test_comprehensive.parquet";
+        let test_items = vec![
+            TestRecord { id: 1, value: "value1".to_string() },
+            TestRecord { id: 2, value: "value2".to_string() },
+            TestRecord { id: 3, value: "value3".to_string() },
+            TestRecord { id: 4, value: "value4".to_string() },
+            TestRecord { id: 5, value: "value5".to_string() },
+        ];
+
+        // Test ParquetBatchWriter functionality
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
+        writer.add_items(test_items.clone()).unwrap();
+        writer.flush().unwrap();  // Ensure all items are written to update stats properly
+
+        // Get writer stats before closing
+        let writer_stats = writer.get_stats().unwrap();
+        writer.close().unwrap();
+
+        // Test read_parquet (Sequential reading with default config)
+        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(2))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items.len(), 5);
+        for (i, item) in test_items.iter().enumerate() {
+            assert_eq!(read_items[i].id, item.id);
+            assert_eq!(read_items[i].value, item.value);
+        }
+
+        // Test read_parquet_with_config
+        let config = ParquetRecordConfig::with_verbose(false);
+        let read_items_config: Vec<TestRecord> = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items_config.len(), 5);
+
+        // Test read_parquet_columns (Sequential column reading)
+        let id_values: Vec<i32> = read_parquet_columns::<arrow::datatypes::Int32Type>(path, "id", Some(2))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(id_values.len(), 5);
+        assert!(id_values.contains(&1));
+        assert!(id_values.contains(&2));
+        assert!(id_values.contains(&3));
+        assert!(id_values.contains(&4));
+        assert!(id_values.contains(&5));
+
+        // Test read_parquet_columns_with_config
+        let id_values_config: Vec<i32> = read_parquet_columns_with_config::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(id_values_config.len(), 5);
+
+        // Test read_parquet_par (Parallel reading)
+        let par_items = read_parquet_par(TestRecord::schema(), path, Some(2))
+            .unwrap();
+        let flat_par_items: Vec<TestRecord> = par_items.flat_map(|batch| batch).collect();
+        assert_eq!(flat_par_items.len(), 5);
+
+        // Test read_parquet_with_config_par (Parallel reading with config)
+        let par_items_config = read_parquet_with_config_par(TestRecord::schema(), path, Some(2), &config)
+            .unwrap();
+        let flat_par_items_config: Vec<TestRecord> = par_items_config.flat_map(|batch| batch).collect();
+        assert_eq!(flat_par_items_config.len(), 5);
+
+        // Test read_parquet_columns_par (Parallel column reading)
+        let par_col_values = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(2))
+            .unwrap();
+        let flat_par_col_values: Vec<i32> = par_col_values.flat_map(|batch| batch).collect();
+        assert_eq!(flat_par_col_values.len(), 5);
+
+        // Test read_parquet_columns_with_config_par (Parallel column reading with config)
+        let par_col_values_config = read_parquet_columns_with_config_par::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
+            .unwrap();
+        let flat_par_col_values_config: Vec<i32> = par_col_values_config.flat_map(|batch| batch).collect();
+        assert_eq!(flat_par_col_values_config.len(), 5);
+
+        assert_eq!(writer_stats.total_items_written, 5);
+        assert!(writer_stats.total_bytes_written > 0);
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_buffer_operations() {
+        let path = "test_buffer.parquet";
+
+        // Test with small buffer to trigger swapping
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
+
+        // Add items one by one to test add_item
+        for i in 1..=5 {
+            writer.add_item(TestRecord {
+                id: i,
+                value: format!("item{}", i),
+            }).unwrap();
+        }
+
+        // Add some more with add_items
+        let more_items = vec![
+            TestRecord { id: 6, value: "item6".to_string() },
+            TestRecord { id: 7, value: "item7".to_string() },
+        ];
+        writer.add_items(more_items).unwrap();
+
+        // Get the buffer length before closing
+        let buffer_len_before_close = writer.buffer_len();
+        writer.close().unwrap();
+
+        // Verify we can read back all items
+        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(3))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items.len(), 7);
+
+        // Test buffer operations - with 7 items and buffer size 2, buffer should have 1 item remaining
+        assert_eq!(buffer_len_before_close, 1); // Buffer has remaining items that haven't been flushed yet
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let path = "test_edge.parquet";
+
+        // Test with empty data
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5));
+        writer.close().unwrap();
+
+        // Reading empty file should return None (no data to read)
+        let empty_reader = read_parquet::<TestRecord>(TestRecord::schema(), path, Some(2));
+        assert!(empty_reader.is_none());  // No data to read means no iterator
+
+        // Test with single item
+        let single_path = "test_single.parquet";
+        let single_writer = ParquetBatchWriter::<TestRecord>::new(single_path.to_string(), Some(5));
+        single_writer.add_item(TestRecord { id: 42, value: "single".to_string() }).unwrap();
+        single_writer.close().unwrap();
+
+        let single_items: Vec<TestRecord> = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(single_items.len(), 1);
+        assert_eq!(single_items[0].id, 42);
+        assert_eq!(single_items[0].value, "single");
+
+        // Clean up
+        use std::fs;
+        let _ = fs::remove_file(path);      // Ignore error if file doesn't exist
+        let _ = fs::remove_file(single_path); // Ignore error if file doesn't exist
+    }
+
+    #[test]
+    fn test_write_stats() {
+        let path = "test_stats.parquet";
+
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(3));
+
+        let items = vec![
+            TestRecord { id: 1, value: "one".to_string() },
+            TestRecord { id: 2, value: "two".to_string() },
+            TestRecord { id: 3, value: "three".to_string() },
+            TestRecord { id: 4, value: "four".to_string() },
+        ];
+
+        writer.add_items(items).unwrap();
+        writer.flush().unwrap();  // Ensure all items in buffer are written
+        let stats = writer.get_stats().unwrap();
+        writer.close().unwrap();
+
+        assert_eq!(stats.total_items_written, 4);
+        assert!(stats.total_bytes_written > 0);
+        assert!(stats.total_batches_written >= 1);  // Should be at least 1 batch, maybe 2 depending on buffering
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_flush_operation() {
+        let path = "test_flush.parquet";
+
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(10));  // Large buffer
+
+        // Add some items
+        for i in 1..=3 {
+            writer.add_item(TestRecord { id: i, value: format!("item{}", i) }).unwrap();
+        }
+
+        // Buffer should have items
+        assert_eq!(writer.buffer_len(), 3);
+
+        // Flush the buffer
+        writer.flush().unwrap();
+        assert_eq!(writer.buffer_len(), 0);
+
+        writer.close().unwrap();
+
+        // Verify items were written
+        let items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(2))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(items.len(), 3);
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_verbose_logging_functionality() {
+        let path = "test_verbose.parquet";
+
+        // Test with verbose logging enabled
+        let config = ParquetRecordConfig::with_verbose(true);
+        let writer = ParquetBatchWriter::<TestRecord>::with_config(
+            path.to_string(),
+            Some(2),
+            config
+        );
+
+        let items = vec![
+            TestRecord { id: 1, value: "verbose1".to_string() },
+            TestRecord { id: 2, value: "verbose2".to_string() },
+        ];
+
+        writer.add_items(items).unwrap();
+        writer.close().unwrap();
+
+        // Verify items were written
+        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, None)
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items.len(), 2);
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_read_parquet_sequential() {
+        let path = "test_read_seq.parquet";
+
+        // Create test data
+        let items = vec![
+            TestRecord { id: 10, value: "first".to_string() },
+            TestRecord { id: 20, value: "second".to_string() },
+            TestRecord { id: 30, value: "third".to_string() },
+            TestRecord { id: 40, value: "fourth".to_string() },
+        ];
+
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
+        writer.add_items(items.clone()).unwrap();
+        writer.close().unwrap();
+
+        // Test read_parquet with different batch sizes
+        for batch_size in [1, 2, 3, 4, 10] {
+            let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(batch_size))
+                .unwrap()
+                .flat_map(|batch| batch)
+                .collect();
+
+            assert_eq!(read_items.len(), 4);
+
+            // Check that all original items are present
+            for (i, original_item) in items.iter().enumerate() {
+                assert_eq!(read_items[i].id, original_item.id);
+                assert_eq!(read_items[i].value, original_item.value);
+            }
+        }
+
+        // Test with default batch size (None)
+        let read_items_default: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, None)
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items_default.len(), 4);
+
+        // Test with configuration
+        let config = ParquetRecordConfig::with_verbose(false);
+        let read_items_config: Vec<TestRecord> = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(read_items_config.len(), 4);
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_read_parquet_parallel() {
+        let path = "test_read_par.parquet";
+
+        // Create test data with multiple items to test different scenarios
+        let items: Vec<TestRecord> = (1..=20).map(|i| TestRecord {
+            id: i,
+            value: format!("item{}", i),
+        }).collect();
+
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5)); // Buffer size 5
+        writer.add_items(items.clone()).unwrap();
+        writer.close().unwrap();
+
+        // Test read_parquet_par - getting individual batches
+        let par_batches = read_parquet_par(TestRecord::schema(), path, Some(3))
+            .unwrap();
+
+        // Verify total count by collecting all items
+        let all_items: Vec<TestRecord> = par_batches.flat_map(|batch| batch).collect();
+        assert_eq!(all_items.len(), 20);
+
+        // Sort both vectors by ID to compare (parallel processing order may vary)
+        let mut all_items_sorted = all_items;
+        all_items_sorted.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut items_sorted = items.clone();
+        items_sorted.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for i in 0..20 {
+            assert_eq!(all_items_sorted[i].id, items_sorted[i].id);
+            assert_eq!(all_items_sorted[i].value, items_sorted[i].value);
+        }
+
+        // Test with configuration
+        let config = ParquetRecordConfig::with_verbose(false);
+        let par_batches_config = read_parquet_with_config_par::<TestRecord>(TestRecord::schema(), path, Some(3), &config)
+            .unwrap();
+        let total_items_config: usize = par_batches_config.flat_map(|batch| batch).count();
+        assert_eq!(total_items_config, 20);
+
+        // Clean up
+        use std::fs;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_read_parquet_edge_cases() {
+        let empty_path = "test_read_empty.parquet";
+
+        // Create empty file
+        let empty_writer = ParquetBatchWriter::<TestRecord>::new(empty_path.to_string(), Some(5));
+        empty_writer.close().unwrap();
+
+        // Test empty file with sequential reader
+        let empty_result = read_parquet::<TestRecord>(TestRecord::schema(), empty_path, Some(2));
+        assert!(empty_result.is_none()); // No data means no iterator
+
+        // Test empty file with parallel reader
+        let empty_par_result = read_parquet_par::<TestRecord>(TestRecord::schema(), empty_path, Some(2));
+        assert!(empty_par_result.is_none()); // No data means no iterator
+
+        // Test single item
+        let single_path = "test_read_single.parquet";
+        let single_writer = ParquetBatchWriter::<TestRecord>::new(single_path.to_string(), Some(5));
+        single_writer.add_item(TestRecord { id: 100, value: "single_item".to_string() }).unwrap();
+        single_writer.close().unwrap();
+
+        // Test single item with sequential reader
+        let single_items: Vec<TestRecord> = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+            .unwrap()
+            .flat_map(|batch| batch)
+            .collect();
+        assert_eq!(single_items.len(), 1);
+        assert_eq!(single_items[0].id, 100);
+        assert_eq!(single_items[0].value, "single_item");
+
+        // Test single item with parallel reader
+        let single_par_result = read_parquet_par::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+            .unwrap();
+        let total_single_items: usize = single_par_result.flat_map(|batch| batch).count();
+        assert_eq!(total_single_items, 1);
+
+        // Clean up
+        use std::fs;
+        let _ = fs::remove_file(empty_path);
+        let _ = fs::remove_file(single_path);
     }
 }
