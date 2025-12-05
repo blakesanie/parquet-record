@@ -4,10 +4,13 @@ use arrow::datatypes::Schema;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
+use rayon::iter::ParallelBridge; // ⬅️ The fix for E0412
+use rayon::iter::FilterMap;
 use std::fs::File;
 use std::io;
 use std::io::BufWriter;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 /// Configuration for parquet record operations.
@@ -632,84 +635,53 @@ pub fn read_parquet_columns_with_config_par<I>(
     column_name: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<
-    Box<
-        dyn rayon::prelude::ParallelIterator<Item = Option<Vec<<I as ArrowPrimitiveType>::Native>>>
-            + Send,
-    >,
->
+) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
 where
-    I: ArrowPrimitiveType + Send,
+    I: ArrowPrimitiveType + Send + Sync + 'static,
 {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use rayon::prelude::*;
     use std::fs::File;
 
-    // First, get the metadata to know how many row groups there are
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(_) => return None,
-    };
-
-    let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
+    // Open file to get metadata
+    let file = File::open(file_path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let metadata = builder.metadata();
     let num_row_groups = metadata.num_row_groups();
 
-    // Create a vector of row group indices to process in parallel
-    let row_group_indices: Vec<usize> = (0..num_row_groups).collect();
+    let file_path = file_path.to_string();
+    let column_name = column_name.to_string();
 
-    // Process each row group in parallel - each thread opens its own file handle
-    let results: Box<
-        dyn rayon::prelude::ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send,
-    > = Box::new(
-        row_group_indices
+    Some(
+        (0..num_row_groups)
             .into_par_iter()
             .filter_map(move |row_group_idx| {
-                // Each thread opens its own file handle to read a specific row group
-                let file = File::open(file_path).ok()?;
+                // Open file for this row group
+                let file = File::open(&file_path).ok()?;
                 let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
-
                 let actual_batch_size = batch_size.unwrap_or_else(|| {
                     std::cmp::max(1, builder.metadata().file_metadata().num_rows() as usize)
                 });
 
-                // Create a reader that reads only the specific row group we want
                 let reader = builder
                     .with_batch_size(actual_batch_size)
-                    .with_row_groups(vec![row_group_idx]) // This should read only this specific row group
+                    .with_row_groups(vec![row_group_idx])
                     .build()
                     .ok()?;
 
-                // Process all batches from this specific row group, extracting only the desired column
                 let mut all_column_values = Vec::new();
-                let col_name = column_name.to_string();
 
-                for record_batch_result in reader {
-                    match record_batch_result {
-                        Ok(record_batch) => {
-                            // Extract the specified column from the record batch
-                            let col_array = record_batch.column_by_name(&col_name)?;
+                for batch_result in reader {
+                    let batch = batch_result.ok()?;
+                    let col_array = batch.column_by_name(&column_name)?;
+                    let values = col_array
+                        .as_any()
+                        .downcast_ref::<arrow::array::PrimitiveArray<I>>()?;
 
-                            // Attempt to cast to the expected primitive array type
-                            if let Some(values) = col_array
-                                .as_any()
-                                .downcast_ref::<arrow::array::PrimitiveArray<I>>()
-                            {
-                                for i in 0..values.len() {
-                                    if !values.is_null(i) {
-                                        all_column_values.push(values.value(i));
-                                    }
-                                }
-                            } else {
-                                // Type mismatch - could not cast to expected type
-                                return None;
-                            }
+                    for i in 0..values.len() {
+                        if !values.is_null(i) {
+                            all_column_values.push(values.value(i));
                         }
-                        Err(_) => return None,
                     }
                 }
 
@@ -719,10 +691,9 @@ where
                     Some(all_column_values)
                 }
             }),
-    );
-
-    Some(results)
+    )
 }
+
 
 /// Read only specified column from parquet in parallel with default configuration (verbose enabled) using Rayon.
 /// Returns a parallel iterator that the caller can continue to operate on.
@@ -730,9 +701,9 @@ pub fn read_parquet_columns_par<I>(
     file_path: &str,
     column_name: &str,
     batch_size: Option<usize>,
-) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
+) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
 where
-    I: ArrowPrimitiveType,
+    I: ParquetRecord + Send + 'static + arrow::array::ArrowPrimitiveType,
 {
     read_parquet_columns_with_config_par::<I>(
         file_path,
@@ -754,59 +725,79 @@ pub fn read_parquet_with_config_par<T>(
 where
     T: ParquetRecord + Send + 'static,
 {
-    // First, get the metadata to know how many row groups there are
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(_) => return None,
-    };
-
-    let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
+    let file = File::open(file_path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let metadata = builder.metadata();
     let num_row_groups = metadata.num_row_groups();
 
-    // Create a vector of row group indices to process in parallel
-    let row_group_indices: Vec<usize> = (0..num_row_groups).collect();
+    let row_group_indices = 0..num_row_groups;
 
-    // Process each row group in parallel - each thread opens its own file handle
-    Some(row_group_indices.into_par_iter().flat_map(|row_group_idx| {
-        let reader: Option<ParquetRecordBatchReader> = (|| {
-            // Each thread opens its own file handle to read a specific row group
-            let file = File::open(file_path).ok()?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let file_path = file_path.to_string();
 
-            let actual_batch_size = batch_size.unwrap_or_else(|| {
-                std::cmp::max(1, builder.metadata().file_metadata().num_rows() as usize)
-            });
-
-            // Create a reader that reads only the specific row group we want
-            // The with_row_groups method should allow us to read specific row groups
-            let reader = builder
-                .with_batch_size(actual_batch_size)
-                .with_row_groups(vec![row_group_idx]) // This should read only this specific row group
-                .build()
-                .ok()?;
-            Some(reader)
-        })();
-
-        if let Some(reader) = reader {
-            Some(reader.filter_map(|record_batch_result| -> Option<Vec<T>> {
-                match record_batch_result {
-                    Ok(record_batch) => match T::records_to_items(&record_batch) {
-                        Ok(items) => Some(items),
-                        Err(_) => None,
-                    },
-                    Err(_) => None,
-                }
-            }))
-        } else {
-            None
-        }
-    }))
+    Some(
+        row_group_indices
+            .into_par_iter()
+            // Step 1: try to create a reader; skip failed ones
+            .filter_map(move |row_group_idx| RowGroupReader::new(row_group_idx, &file_path, batch_size))
+            // Step 2: flatten each reader into its batches
+            .flat_map(|reader| reader)  // reader: RowGroupReader<T> implements ParallelIterator<Item=Vec<T>>
+    )
 }
+
+pub struct RowGroupReader<T: ParquetRecord + Send + 'static> {
+    reader: ParquetRecordBatchReader,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: ParquetRecord + Send + 'static> RowGroupReader<T> {
+    pub fn new(row_group_idx: usize, file_path: &str, batch_size: Option<usize>) -> Option<Self> {
+        let file = File::open(file_path).ok()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+
+        let actual_batch_size = batch_size.unwrap_or_else(|| {
+            std::cmp::max(1, builder.metadata().file_metadata().num_rows() as usize)
+        });
+
+        let reader = builder
+            .with_batch_size(actual_batch_size)
+            .with_row_groups(vec![row_group_idx])
+            .build()
+            .ok()?;
+
+        Some(Self {
+            reader,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<T: ParquetRecord + Send + 'static> ParallelIterator for RowGroupReader<T> {
+    type Item = Vec<T>;
+
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>
+    {
+        // Create the parallel iterator we want to delegate to
+        let par_iter = self.reader
+            .into_iter()
+            .par_bridge()
+            .filter_map(process_batch_result::<T>);
+
+        par_iter.drive_unindexed(consumer)
+    }
+}
+
+fn process_batch_result<T: ParquetRecord>(
+    batch: Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError>
+) -> Option<Vec<T>>
+{
+    match batch {
+        Ok(batch) => T::records_to_items(&batch).ok(),
+        Err(_) => None,
+    }
+}
+
 
 /// Read parquet in parallel with default configuration (verbose enabled) using Rayon.
 /// Returns a vector of results that can be converted to a parallel iterator.
@@ -814,7 +805,7 @@ pub fn read_parquet_par<T>(
     schema: Arc<Schema>,
     file_path: &str,
     batch_size: Option<usize>,
-) -> Option<Vec<Vec<T>>>
+) -> Option<impl ParallelIterator<Item = Vec<T>>>
 where
     T: ParquetRecord + Send + 'static,
 {
