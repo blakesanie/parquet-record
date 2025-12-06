@@ -1,17 +1,15 @@
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::Schema;
-use crossbeam_channel::{Sender, Receiver};
+use crossbeam_channel::Sender;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use rayon::prelude::*;
 use rayon::iter::ParallelBridge; // ⬅️ The fix for E0412
-use rayon::iter::FilterMap;
 use std::fs::File;
 use std::io;
 use std::io::BufWriter;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 /// Configuration for parquet record operations.
@@ -80,31 +78,24 @@ impl<T: ParquetRecord> BatchBuffer<T> {
 /// on the same calling thread, while the primary buffer remains available for other threads.
 /// The file and writers are created lazily on first use, only when there's actual data to write.
 
-/// Statistics about the writing process.
-#[derive(Debug, Default, Clone)]
-pub struct WriteStats {
-    pub total_items_written: usize,
-    pub total_batches_written: usize,
-    pub total_bytes_written: usize,
-}
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
-pub struct ParquetBatchWriter<T: ParquetRecord> {
+pub struct ParquetBatchWriter<T: ParquetRecord + Clone> {
     buffer: Mutex<BatchBuffer<T>>,
     buffer_size: usize,
-    write_sender: Sender<(RecordBatch, usize)>, // Channel to send data to the write thread
+    write_sender: crossbeam_channel::Sender<Option<(RecordBatch, usize)>>, // Channel to send data to the write thread (None = shutdown)
     schema: Arc<Schema>, // Store the schema to avoid calling T::schema() repeatedly
     output_file: String,
     config: ParquetRecordConfig,
-    stats: Mutex<WriteStats>,
     closed: AtomicBool,
+    // Mutex to ensure only one thread can swap/clear the buffer at a time
+    buffer_swap_mutex: Mutex<()>,
     // Hold the join handle to ensure the write thread finishes properly
     _write_thread_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
+impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
     /// Creates a new batch writer for a specific output file
     pub fn new(output_file: String, buffer_size: Option<usize>) -> Self {
         Self::with_config(output_file, buffer_size, ParquetRecordConfig::default())
@@ -115,15 +106,122 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
         buffer_size: Option<usize>,
         config: ParquetRecordConfig,
     ) -> Self {
+        // Create bounded channel to communicate with the write thread - only allow 1 pending buffer at a time
+        let (write_sender, write_receiver): (Sender<Option<(RecordBatch, usize)>>, crossbeam_channel::Receiver<Option<(RecordBatch, usize)>>) = crossbeam_channel::bounded(1);
+
+        // Spawn a dedicated write thread
+        let write_thread_output_file = output_file.clone();
+        let write_thread_config = config.clone();
+        let write_thread_handle = std::thread::spawn(move || {
+            // This thread will own the ArrowWriter exclusively to prevent row group issues
+            let mut file_writer: Option<ArrowWriter<BufWriter<File>>> = None;
+
+            let mut items_written = 0;
+            let mut batches_written = 0;
+            let mut bytes_written = 0;
+
+            loop {
+                match write_receiver.recv() {
+                    Ok(Some((record_batch, batch_size_bytes))) => {
+                        // Initialize writer if this is the first batch
+                        if file_writer.is_none() {
+                            let file = match File::create(&write_thread_output_file) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    eprintln!("File creation error: {}", e);
+                                    return;
+                                }
+                            };
+                            let buf_writer = BufWriter::new(file);
+
+                            let mut writer = match ArrowWriter::try_new(buf_writer, record_batch.schema(), None) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    eprintln!("ArrowWriter creation error: {}", e);
+                                    return;
+                                }
+                            };
+
+                            // Write the first batch
+                            if let Err(e) = writer.write(&record_batch) {
+                                eprintln!("Initial write error: {}", e);
+                                return;
+                            }
+
+                            file_writer = Some(writer);
+                        } else if let Some(ref mut writer) = file_writer {
+                            // For subsequent writes, just write the data
+                            if let Err(e) = writer.write(&record_batch) {
+                                eprintln!("Parquet write error: {}", e);
+                                return;
+                            }
+                        }
+
+                        // Update statistics using mutex
+                        {
+                            items_written += record_batch.num_rows();
+                            batches_written += 1;
+                            bytes_written += batch_size_bytes;
+
+                            if write_thread_config.verbose {
+                                let mb_written = (batch_size_bytes as f64 / (1024.0 * 1024.0)).ceil() as usize;
+                                let total_mb_written = (bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
+                                eprintln!(
+                                    "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}) Total: {} records / {} MB",
+                                    write_thread_output_file,
+                                    record_batch.num_rows(),
+                                    mb_written,
+                                    batches_written,
+                                    items_written,
+                                    total_mb_written
+                                );
+                            }
+                        }  // End of mutex scope
+                    }
+                    Ok(None) => {
+                        // Shutdown signal received - exit the thread
+                        break;
+                    }
+                    Err(_) => {
+                        // Channel disconnected - exit the thread
+                        break;
+                    }
+                }
+            }
+
+            // At this point, the receiver has been closed, so no more batches will arrive
+            // Close the writer when shutting down
+            if let Some(writer) = file_writer {
+                if let Err(e) = writer.close() {
+                    eprintln!("Writer close error: {}", e);
+                }
+
+                // Report final stats from the shared stats
+                if write_thread_config.verbose {
+                    let total_mb_written = (bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
+                    eprintln!(
+                        "[ParquetWriter {}] Final stats - Total items: {}, Total batches: {}, Total MB: {}",
+                        write_thread_output_file,
+                        items_written,
+                        batches_written,
+                        total_mb_written
+                    );
+                }
+            }
+        });
+
+        // Now that we've created the writer thread and shared stats, we need to set up the ParquetBatchWriter
+        // with access to that shared stats structure
         Self {
             buffer: Mutex::new(BatchBuffer::new(buffer_size.unwrap_or(1024))), // Default to 1024 if None
             buffer_size: buffer_size.unwrap_or(usize::MAX), // Use usize::MAX when no buffer size is provided
-            file_writer: Mutex::new(None), // Initially None - no file operations yet
+            write_sender,
             schema: T::schema(),
             output_file,
             config,
-            stats: Mutex::new(WriteStats::default()),
-            closed: Mutex::new(false),
+            closed: AtomicBool::new(false),
+            buffer_swap_mutex: Mutex::new(()),
+            _write_thread_handle: std::sync::Mutex::new(Some(write_thread_handle)),
         }
     }
 
@@ -150,13 +248,23 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
                 let available_space = self.buffer_size - buffer_guard.items.len();
 
                 if available_space == 0 {
-                    // Buffer is full, write it out
-                    let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
-                    std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
-                    drop(buffer_guard);
+                    // Acquire the swap mutex while still holding buffer guard to ensure only one thread can swap
+                    let _swap_guard = self.buffer_swap_mutex.lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer swap mutex poisoned"))?;
 
-                    self.write_buffer_to_disk(secondary_buffer)?;
-                    continue; // Check again with empty buffer
+                    // Double-check if buffer is still full after acquiring swap mutex
+                    if buffer_guard.items.len() >= self.buffer_size {
+                        let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
+                        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
+                        drop(buffer_guard);
+
+                        self.write_buffer_to_disk(secondary_buffer)?;
+                        continue; // Check again with empty buffer
+                    } else {
+                        // Another thread already handled the swap while we waited for the swap mutex
+                        drop(buffer_guard);
+                        continue;
+                    }
                 }
 
                 let take_count = std::cmp::min(available_space, remaining_items.len());
@@ -166,11 +274,21 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
 
                 // If buffer is now full, write it out
                 if buffer_guard.items.len() >= self.buffer_size {
-                    let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
-                    std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
-                    drop(buffer_guard);
+                    // Acquire the swap mutex while still holding buffer guard to ensure only one thread can swap
+                    let _swap_guard = self.buffer_swap_mutex.lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer swap mutex poisoned"))?;
 
-                    self.write_buffer_to_disk(secondary_buffer)?;
+                    // Double-check if buffer is still full after acquiring swap mutex
+                    if buffer_guard.items.len() >= self.buffer_size {
+                        let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
+                        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
+                        drop(buffer_guard);
+
+                        self.write_buffer_to_disk(secondary_buffer)?;
+                    } else {
+                        // Another thread already handled the swap while we waited for the swap mutex
+                        drop(buffer_guard);
+                    }
                 }
             }
             Ok(())
@@ -194,29 +312,49 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
 
             if buffer_guard.items.len() >= self.buffer_size {
-                // Buffer is full, write it out
-                let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
-                std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
-                drop(buffer_guard);
+                // Acquire the swap mutex while still holding buffer guard to ensure only one thread can swap
+                let _swap_guard = self.buffer_swap_mutex.lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer swap mutex poisoned"))?;
 
-                self.write_buffer_to_disk(secondary_buffer)?;
-
-                // Now add the item to the newly available buffer
-                let mut buffer_guard = self
-                    .buffer
-                    .lock()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
-                buffer_guard.items.push(item);
-            } else {
-                buffer_guard.items.push(item);
-
-                // Check if buffer is now full after adding the item
+                // Double-check if buffer is still full after acquiring swap mutex
                 if buffer_guard.items.len() >= self.buffer_size {
                     let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
                     std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
                     drop(buffer_guard);
 
                     self.write_buffer_to_disk(secondary_buffer)?;
+
+                    // Now add the item to the newly available buffer
+                    let mut buffer_guard = self
+                        .buffer
+                        .lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                    buffer_guard.items.push(item);
+                } else {
+                    // Another thread already handled the swap while we waited for the swap mutex
+                    drop(buffer_guard);
+                    return Ok(());
+                }
+            } else {
+                buffer_guard.items.push(item);
+
+                // Check if buffer is now full after adding the item
+                if buffer_guard.items.len() >= self.buffer_size {
+                    // Acquire the swap mutex while still holding buffer guard to ensure only one thread can swap
+                    let _swap_guard = self.buffer_swap_mutex.lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer swap mutex poisoned"))?;
+
+                    // Double-check if buffer is still full after acquiring swap mutex
+                    if buffer_guard.items.len() >= self.buffer_size {
+                        let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
+                        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
+                        drop(buffer_guard);
+
+                        self.write_buffer_to_disk(secondary_buffer)?;
+                    } else {
+                        // Another thread already handled the swap while we waited for the swap mutex
+                        drop(buffer_guard);
+                    }
                 }
             }
             Ok(())
@@ -230,81 +368,18 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             return Ok(());
         }
 
-        // This is the first function that knows there's actually data to write,
-        // so it's where we do all the lazy initialization
-        let mut writer_guard = self
-            .file_writer
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
-
         // Convert the buffer to a record batch to get the initial schema/data
-        let buffer_count = buffer.items.len();
         let record_batch = T::items_to_records(self.schema.clone(), &buffer.items);
-        drop(buffer);
 
         // Get the size of the record batch before writing for logging purposes
         let batch_size_bytes = self.calculate_batch_size(&record_batch);
 
-        // Lazy initialization: create file, buf_writer, and arrow_writer only when data arrives
-        if writer_guard.is_none() {
-            // Now we know we need to create the file - do all the expensive operations here
-            // Create parent directories if they don't exist
-            if let Some(parent) = std::path::Path::new(&self.output_file).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            
-            let file = File::create(&self.output_file).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("File creation error: {}", e))
-            })?;
-            let buf_writer = BufWriter::new(file); // Create BufWriter
-
-            // Create the ArrowWriter with the file and schema
-            let mut writer = ArrowWriter::try_new(buf_writer, record_batch.schema(), None)
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("ArrowWriter creation error: {}", e),
-                    )
-                })?;
-
-            // Write the first batch immediately
-            writer.write(&record_batch).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Initial write error: {}", e))
-            })?;
-
-            // Store the writer for future use
-            *writer_guard = Some(writer);
-        } else if let Some(ref mut writer) = *writer_guard {
-            // For subsequent writes, just write the data
-            writer.write(&record_batch).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e))
-            })?;
+        // Send the record batch to the dedicated write thread via channel
+        if let Err(_) = self.write_sender.send(Some((record_batch, batch_size_bytes))) {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to send batch to write thread"));
         }
 
-        // Update and print statistics if verbose
-        let mut stats_guard = self
-            .stats
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
-
-        stats_guard.total_items_written += buffer_count;
-        stats_guard.total_batches_written += 1;
-        stats_guard.total_bytes_written += batch_size_bytes;
-
-        if self.config.verbose {
-            let mb_written = (batch_size_bytes as f64 / (1024.0 * 1024.0)).ceil() as usize;
-            let total_mb_written =
-                (stats_guard.total_bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
-            println!(
-                "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}) Total items: {} / {} MB",
-                self.output_file,
-                buffer_count,
-                mb_written,
-                stats_guard.total_batches_written,
-                stats_guard.total_items_written,
-                total_mb_written
-            );
-        }
+        // No local stats updates - the write thread handles all stats and logging
 
         Ok(())
     }
@@ -320,15 +395,25 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
             return Ok(());
         }
 
-        // Only write if we have items
-        let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
-        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
+        // Acquire the swap mutex while still holding buffer guard to ensure only one thread can swap
+        let _swap_guard = self.buffer_swap_mutex.lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer swap mutex poisoned"))?;
 
-        // Unlock the primary buffer immediately so other threads can continue
-        drop(buffer_guard);
+        // Double-check if buffer still has items after acquiring swap mutex
+        if !buffer_guard.items.is_empty() {
+            let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
+            std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
-        // Write the secondary buffer to disk
-        self.write_buffer_to_disk(secondary_buffer)
+            // Unlock the primary buffer immediately so other threads can continue
+            drop(buffer_guard);
+
+            // Write the secondary buffer to disk
+            self.write_buffer_to_disk(secondary_buffer)
+        } else {
+            // Someone else already took care of it while we were waiting for the mutex
+            drop(buffer_guard);
+            Ok(())
+        }
     }
 
     /// Gets the number of items currently in the buffer
@@ -345,58 +430,27 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
     }
 
     pub fn close_no_consume(&self) -> Result<(), io::Error> {
-        let mut closed_guard = self.closed.lock().unwrap();
-        if *closed_guard == true {
+        let already_closed = self.closed.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err();
+        if already_closed {
             return Ok(());
         }
-        *closed_guard = true;
-        drop(closed_guard);
 
-        // Flush any remaining items
+        // Flush any remaining items to ensure they're sent to the write thread
         self.flush()?;
 
-        // Print final stats if verbose
-        if self.config.verbose {
-            let stats_guard = self
-                .stats
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
-            let total_mb_written =
-                (stats_guard.total_bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
-            println!(
-                "[ParquetWriter {}] Final stats - Total items: {}, Total batches: {}, Total MB: {}",
-                self.output_file,
-                stats_guard.total_items_written,
-                stats_guard.total_batches_written,
-                total_mb_written
-            );
-        }
+        // Signal the write thread to shut down by sending a None (shutdown signal)
+        let _ = self.write_sender.send(None);
 
-        // Close the writer if it was created
-        let maybe_writer = {
-            let mut writer_guard = self
-                .file_writer
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
-            writer_guard.take() // This removes the writer from the option
-        };
-
-        if let Some(writer) = maybe_writer {
-            writer.close().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Writer close error: {}", e))
-            })?;
+        // Join the write thread to ensure it completes
+        let handle_opt = self._write_thread_handle.lock().unwrap().take();
+        if let Some(handle) = handle_opt {
+            if let Err(e) = handle.join() {
+                // Handle thread panic if necessary
+                eprintln!("Write thread panicked: {:?}", e);
+            }
         }
 
         Ok(())
-    }
-
-    /// Returns the current write statistics
-    pub fn get_stats(&self) -> Result<WriteStats, io::Error> {
-        let stats_guard = self
-            .stats
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
-        Ok(stats_guard.clone())
     }
 
     /// Calculate the approximate size of a record batch in bytes
@@ -409,6 +463,13 @@ impl<T: ParquetRecord + Clone + 'static> ParquetBatchWriter<T> {
         }
 
         total_size
+    }
+}
+
+impl<T: ParquetRecord + Clone> Drop for ParquetBatchWriter<T> {
+    fn drop(&mut self) {
+        // Call close to ensure any remaining data in the buffer is flushed and processed
+        let _ = self.close_no_consume();
     }
 }
 
@@ -1016,8 +1077,6 @@ mod tests {
         writer.add_items(test_items.clone()).unwrap();
         writer.flush().unwrap();  // Ensure all items are written to update stats properly
 
-        // Get writer stats before closing
-        let writer_stats = writer.get_stats().unwrap();
         writer.close().unwrap();
 
         // Test read_parquet (Sequential reading with default config)
@@ -1081,9 +1140,6 @@ mod tests {
             .unwrap();
         let flat_par_col_values_config: Vec<i32> = par_col_values_config.flat_map(|batch| batch).collect();
         assert_eq!(flat_par_col_values_config.len(), 5);
-
-        assert_eq!(writer_stats.total_items_written, 5);
-        assert!(writer_stats.total_bytes_written > 0);
 
         // Clean up
         use std::fs;
@@ -1178,12 +1234,7 @@ mod tests {
 
         writer.add_items(items).unwrap();
         writer.flush().unwrap();  // Ensure all items in buffer are written
-        let stats = writer.get_stats().unwrap();
         writer.close().unwrap();
-
-        assert_eq!(stats.total_items_written, 4);
-        assert!(stats.total_bytes_written > 0);
-        assert!(stats.total_batches_written >= 1);  // Should be at least 1 batch, maybe 2 depending on buffering
 
         // Clean up
         use std::fs;
