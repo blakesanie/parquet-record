@@ -1,3 +1,5 @@
+mod pool;
+
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::Schema;
