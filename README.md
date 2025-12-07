@@ -312,11 +312,34 @@ The library is designed around Arrow's memory layout for optimal performance:
 - **Lazy Writing**: Files and writers are created only when data arrives
 - **Parallel Operations**: Reading operations can leverage multiple cores via Rayon
 
+## Release Process
+
+This library uses GitHub Actions to automate releases to crates.io:
+
+### Auto-bumping on merge (auto-bump.yml)
+- Automatically bumps version based on conventional commit messages when merging to main
+- `feat:` or `Feature:` commits trigger minor version bump
+- `fix:` or `Bugfix:` commits trigger patch version bump
+- `BREAKING CHANGE` or `!:` commits trigger major version bump
+- After bumping, automatically publishes to crates.io
+
+### Manual Publishing (publish.yml)
+- Automatically publishes to crates.io when the version in `Cargo.toml` changes
+- This happens when a new version tag is pushed to the main branch
+
+### Manual Version Bumping (bump-version.yml)
+- The `bump-version.yml` workflow allows manual version bumps with major/minor/patch options
+- This can be triggered manually via GitHub Actions UI
+- After running this workflow, the version is bumped, committed, published to crates.io, and tagged
+
+### Requirements
+- Set up the `CARGO_REGISTRY_TOKEN` secret in GitHub repository settings
+- Version bumps are only published to crates.io when the workflow runs successfully
+
 ## License
 
-This project is licensed under either of:
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+## Maintainer
 
-at your option.
+- Blake Sanie (blake@sanie.com)

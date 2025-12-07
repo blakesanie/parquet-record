@@ -1,0 +1,96 @@
+name: Bump Version and Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump-type:
+        description: 'Type of version bump'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+        - major
+        - minor
+        - patch
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install cargo-edit for version management
+      run: cargo install cargo-edit
+    
+    - name: Get current version
+      id: current_version
+      run: |
+        cd src/parquet-record
+        VERSION=$(grep -E "^version = " Cargo.toml | head -n1 | cut -d '"' -f2)
+        echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Current version: $VERSION"
+    
+    - name: Bump version using cargo-edit
+      run: |
+        cd src/parquet-record
+        case "${{ inputs.bump-type }}" in
+          "major")
+            cargo set-version --bump major
+            ;;
+          "minor")
+            cargo set-version --bump minor
+            ;;
+          "patch")
+            cargo set-version --bump patch
+            ;;
+        esac
+    
+    - name: Get new version
+      id: new_version
+      run: |
+        cd src/parquet-record
+        NEW_VERSION=$(grep -E "^version = " Cargo.toml | head -n1 | cut -d '"' -f2)
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "New version: $NEW_VERSION"
+    
+    - name: Run tests
+      run: |
+        cd src/parquet-record
+        cargo test --verbose
+    
+    - name: Commit version change
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add src/parquet-record/Cargo.toml
+        git commit -m "Bump version to ${{ steps.new_version.outputs.new_version }}"
+        git push origin main
+    
+    - name: Login to crates.io
+      run: |
+        cd src/parquet-record
+        cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    
+    - name: Publish to crates.io
+      run: |
+        cd src/parquet-record
+        cargo publish
+      if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    
+    - name: Create Git tag
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git tag -a v${{ steps.new_version.outputs.new_version }} -m "Release version ${{ steps.new_version.outputs.new_version }}"
+        git push origin v${{ steps.new_version.outputs.new_version }}

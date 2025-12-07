@@ -2,9 +2,9 @@
 name = "parquet-record"
 version = "0.1.0"
 edition = "2021"
-authors = ["Maintainer Name <maintainer@example.com>"]
+authors = ["Blake Sanie <blake@sanie.com>"]
 description = "A Rust library for efficient serialization and deserialization of structs to/from Parquet format with support for batch writing and parallel reading"
-license = "MIT/Apache-2.0"
+license = "MIT"
 
 [lib]
 name = "parquet_record"
