@@ -5,30 +5,23 @@ use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchR
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use rayon::prelude::*;
-use rayon::iter::ParallelBridge; // ⬅️ The fix for E0412
-use rayon::iter::FilterMap;
+use rayon::iter::ParallelBridge;
 use std::fs::File;
 use std::{fs, io};
-use std::io::{BufWriter, ErrorKind};
-use std::marker::PhantomData;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Configuration for parquet record operations.
 #[derive(Debug, Clone)]
 pub struct ParquetRecordConfig {
-    /// Whether to show verbose logging output.
     pub verbose: bool,
 }
 
 impl ParquetRecordConfig {
-    /// Creates a new configuration with verbose logging enabled.
     pub fn with_verbose(verbose: bool) -> Self {
         Self { verbose }
     }
 
-    /// Creates a new configuration with verbose logging disabled.
     pub fn silent() -> Self {
         Self { verbose: false }
     }
@@ -41,8 +34,6 @@ impl Default for ParquetRecordConfig {
 }
 
 /// A trait for types that can be serialized to and from Parquet format.
-///
-/// Implementors must provide schema definition and conversion methods to and from RecordBatch.
 pub trait ParquetRecord: Send + Sync {
     /// Returns the schema for this record type.
     fn schema() -> Arc<Schema>;
@@ -58,10 +49,9 @@ pub trait ParquetRecord: Send + Sync {
         Self: Sized;
 }
 
-/// A buffer of items that can be processed
 #[derive(Debug)]
 pub struct BatchBuffer<T: ParquetRecord> {
-    pub items: Vec<T>, // Unconverted items
+    pub items: Vec<T>,
 }
 
 impl<T: ParquetRecord> BatchBuffer<T> {
@@ -76,11 +66,6 @@ impl<T: ParquetRecord> BatchBuffer<T> {
     }
 }
 
-/// A batch writer that maintains a primary buffer protected by a mutex.
-/// When the buffer is full, it's swapped with a secondary buffer and written to disk
-/// on the same calling thread, while the primary buffer remains available for other threads.
-/// The file and writers are created lazily on first use, only when there's actual data to write.
-
 /// Statistics about the writing process.
 #[derive(Debug, Default, Clone)]
 pub struct WriteStats {
@@ -93,8 +78,8 @@ pub struct WriteStats {
 pub struct ParquetBatchWriter<T: ParquetRecord + Clone> {
     buffer: Mutex<BatchBuffer<T>>,
     buffer_size: usize,
-    file_writer: Mutex<Option<Box<ArrowWriter<BufWriter<File>>>>>, // Writer is created lazily on first write
-    schema: Arc<Schema>, // Store the schema to avoid calling T::schema() repeatedly
+    file_writer: Mutex<Option<Box<ArrowWriter<BufWriter<File>>>>>, // Created lazily on first write
+    schema: Arc<Schema>,
     output_file: String,
     config: ParquetRecordConfig,
     stats: Mutex<WriteStats>,
@@ -102,7 +87,6 @@ pub struct ParquetBatchWriter<T: ParquetRecord + Clone> {
 }
 
 impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
-    /// Creates a new batch writer for a specific output file
     pub fn new(output_file: String, buffer_size: Option<usize>) -> Self {
         Self::with_config(output_file, buffer_size, ParquetRecordConfig::default())
     }
@@ -113,9 +97,9 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
         config: ParquetRecordConfig,
     ) -> Self {
         Self {
-            buffer: Mutex::new(BatchBuffer::new(buffer_size.unwrap_or(1024))), // Default to 1024 if None
-            buffer_size: buffer_size.unwrap_or(usize::MAX), // Use usize::MAX when no buffer size is provided
-            file_writer: Mutex::new(None), // Initially None - no file operations yet
+            buffer: Mutex::new(BatchBuffer::new(buffer_size.unwrap_or(1024))),
+            buffer_size: buffer_size.unwrap_or(usize::MAX),
+            file_writer: Mutex::new(None),
             schema: T::schema(),
             output_file,
             config,
@@ -129,35 +113,32 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
     pub fn add_items(&self, items: Vec<T>) -> Result<(), io::Error> {
         let closed_guard = self.closed.read().unwrap();
         if *closed_guard {
-            return Err(io::Error::new(ErrorKind::Other, "already closed"));
+            return Err(io::Error::other("already closed"));
         }
         if self.buffer_size == usize::MAX {
-            // No buffer size limit - just add to buffer
             let mut buffer_guard = self
                 .buffer
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
             buffer_guard.items.extend(items);
             Ok(())
         } else {
-            // Process items in chunks of buffer_size to ensure exact batch sizes
             let mut remaining_items = items;
             while !remaining_items.is_empty() {
                 let mut buffer_guard = self
                     .buffer
                     .lock()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                    .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
 
                 let available_space = self.buffer_size - buffer_guard.items.len();
 
                 if available_space == 0 {
-                    // Buffer is full, write it out
                     let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
                     std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
                     drop(buffer_guard);
 
                     self.write_buffer_to_disk(secondary_buffer)?;
-                    continue; // Check again with empty buffer
+                    continue;
                 }
 
                 let take_count = std::cmp::min(available_space, remaining_items.len());
@@ -165,7 +146,6 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
                 buffer_guard.items.extend_from_slice(items_to_add);
                 remaining_items = remaining.to_vec();
 
-                // If buffer is now full, write it out
                 if buffer_guard.items.len() >= self.buffer_size {
                     let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
                     std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
@@ -181,41 +161,36 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
     pub fn add_item(&self, item: T) -> Result<(), io::Error> {
         let closed_guard = self.closed.read().unwrap();
         if *closed_guard {
-            return Err(io::Error::new(ErrorKind::Other, "already closed"));
+            return Err(io::Error::other("already closed"));
         }
         if self.buffer_size == usize::MAX {
-            // No buffer size limit - just add to buffer
             let mut buffer_guard = self
                 .buffer
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
             buffer_guard.items.push(item);
             Ok(())
         } else {
-            // Check if buffer has space, if not, write it out first
             let mut buffer_guard = self
                 .buffer
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
 
             if buffer_guard.items.len() >= self.buffer_size {
-                // Buffer is full, write it out
                 let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
                 std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
                 drop(buffer_guard);
 
                 self.write_buffer_to_disk(secondary_buffer)?;
 
-                // Now add the item to the newly available buffer
                 let mut buffer_guard = self
                     .buffer
                     .lock()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+                    .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
                 buffer_guard.items.push(item);
             } else {
                 buffer_guard.items.push(item);
 
-                // Check if buffer is now full after adding the item
                 if buffer_guard.items.len() >= self.buffer_size {
                     let mut secondary_buffer = BatchBuffer::new(self.buffer_size);
                     std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
@@ -235,61 +210,48 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             return Ok(());
         }
 
-        // This is the first function that knows there's actually data to write,
-        // so it's where we do all the lazy initialization
         let mut writer_guard = self
             .file_writer
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
+            .map_err(|_| io::Error::other("Writer lock poisoned"))?;
 
-        // Convert the buffer to a record batch to get the initial schema/data
         let record_batch = T::items_to_records(self.schema.clone(), &buffer.items);
 
-        // Get the size of the record batch before writing for logging purposes
         let batch_size_bytes = self.calculate_batch_size(&record_batch);
 
-        // Lazy initialization: create file, buf_writer, and arrow_writer only when data arrives
         if writer_guard.is_none() {
-            // Now we know we need to create the file - do all the expensive operations here
             let path = Path::new(&self.output_file);
             if let Some(parent) = path.parent() {
-                // Create all directories in the path if they don't exist
                 fs::create_dir_all(parent)?;
             }
             let file = File::create(path).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("File creation error: {}", e))
+                io::Error::other(format!("File creation error: {}", e))
             })?;
-            let buf_writer = BufWriter::new(file); // Create BufWriter
+            let buf_writer = BufWriter::new(file);
 
-            // Create the ArrowWriter with the file and schema
             let writer = ArrowWriter::try_new(buf_writer, record_batch.schema(), None)
                 .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("ArrowWriter creation error: {}", e),
                     )
                 })?;
             let mut boxed_writer = Box::new(writer);
 
-            // Write the first batch immediately
             boxed_writer.write(&record_batch).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Initial write error: {}", e))
+                io::Error::other(format!("Initial write error: {}", e))
             })?;
 
-            // Store the writer for future use
             *writer_guard = Some(boxed_writer);
         } else if let Some(ref mut writer) = *writer_guard {
-            // For subsequent writes, just write the data
             writer.write(&record_batch).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e))
+                io::Error::other(format!("Parquet write error: {}", e))
             })?;
         }
 
-        // Update and print statistics if verbose
         let mut stats_guard = self
             .stats
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
+            .map_err(|_| io::Error::other("Stats lock poisoned"))?;
 
         stats_guard.total_items_written += buffer.items.len();
         stats_guard.total_batches_written += 1;
@@ -318,20 +280,17 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
         let mut buffer_guard = self
             .buffer
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Buffer lock poisoned"))?;
+            .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
 
         if buffer_guard.items.is_empty() {
             return Ok(());
         }
 
-        // Only write if we have items
         let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
         std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
 
-        // Unlock the primary buffer immediately so other threads can continue
         drop(buffer_guard);
 
-        // Write the secondary buffer to disk
         self.write_buffer_to_disk(secondary_buffer)
     }
 
@@ -354,9 +313,6 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             return Ok(())
         }
         *closed_guard = true;
-        if self.output_file.ends_with("5_8_12.parquet") {
-            dbg!();
-        }
         // Flush any remaining items
         self.flush()?;
 
@@ -365,7 +321,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             let stats_guard = self
                 .stats
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
+                .map_err(|_| io::Error::other("Stats lock poisoned"))?;
             let total_mb_written =
                 (stats_guard.total_bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
             println!(
@@ -377,18 +333,17 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             );
         }
 
-        // Close the writer if it was created
         let maybe_writer = {
             let mut writer_guard = self
                 .file_writer
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer lock poisoned"))?;
-            writer_guard.take() // This removes the writer from the option
+                .map_err(|_| io::Error::other("Writer lock poisoned"))?;
+            writer_guard.take()
         };
 
         if let Some(writer) = maybe_writer {
             writer.close().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Writer close error: {}", e))
+                io::Error::other(format!("Writer close error: {}", e))
             })?;
         }
 
@@ -400,7 +355,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
         let stats_guard = self
             .stats
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Stats lock poisoned"))?;
+            .map_err(|_| io::Error::other("Stats lock poisoned"))?;
         Ok(stats_guard.clone())
     }
 
@@ -409,7 +364,6 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
         let mut total_size = 0;
 
         for column in record_batch.columns() {
-            // Use Arrow's built-in method to get the physical size of the array
             total_size += column.get_array_memory_size();
         }
 
@@ -433,20 +387,17 @@ pub fn read_parquet_with_config<T>(
 where
     T: ParquetRecord,
 {
-    // 1. Open the file
     let file = match File::open(file_path) {
         Ok(f) => f,
-        // If file open fails, we return an iterator that yields one error and stops.
         Err(_e) => {
             return None;
         }
     };
 
-    // 2. Create the ParquetRecordBatchReader
     let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[ParquetRecordBatchReaderBuilder] Cannot create ParquetRecordBatchReaderBuilder: {}", e);
+            eprintln!("[ParquetReader] Cannot create reader: {}", e);
             return None;
         }
     };
@@ -454,48 +405,34 @@ where
     let metadata = builder.metadata();
     let total_rows = metadata.file_metadata().num_rows() as usize;
 
-    // Set the batch size to the provided value, or use the default from the reader if not specified
-    let actual_batch_size = batch_size.unwrap_or_else(|| {
-        std::cmp::max(1, total_rows) // Use at least 1 as batch size
-    });
+    let actual_batch_size = batch_size.unwrap_or_else(|| std::cmp::max(1, total_rows));
     let reader = match builder.with_batch_size(actual_batch_size).build() {
         Ok(r) => r,
         Err(_e) => {
-            eprintln!("[ParquetRecordBatchReaderBuilder] Cannot build ParquetRecordBatchReaderBuilder: {_e}");
+            eprintln!("[ParquetReader] Cannot build reader: {_e}");
             return None;
         }
     };
 
     let scanned_iterator = reader.scan(false, |errored, record_batch_result| {
-        // 1. Check for previous error
         if *errored {
             return None;
         }
 
         match record_batch_result {
-            // Case A: Successful Arrow RecordBatch read
             Ok(record_batch) => {
                 match T::records_to_items(&record_batch) {
-                    // ⭐ SUCCESS: Wrap the result in Some()
                     Ok(vec_t) => Some(vec_t),
                     Err(e) => {
-                        // Conversion error: Log, set state to stop, and return None.
                         eprintln!("[ParquetReader] Error converting batch: {}", e);
                         *errored = true;
-                        // ⭐ STOP: Return None
                         None
                     }
                 }
             }
-            // Case B: Parquet I/O read error
             Err(e) => {
-                // I/O error: Log, set state to stop, and return None.
-                eprintln!(
-                    "[ParquetReader] Parquet read error, stopping iteration: {}",
-                    e
-                );
+                eprintln!("[ParquetReader] Parquet read error: {}", e);
                 *errored = true;
-                // ⭐ STOP: Return None
                 None
             }
         }
@@ -533,24 +470,18 @@ pub fn read_parquet_columns_with_config<I>(
 where
     I: ArrowPrimitiveType,
 {
-    // 1. Open the file
     let file = match File::open(file_path) {
         Ok(f) => f,
-        // If file open fails, we return an iterator that yields one error and stops.
         Err(e) => {
-            eprintln!("[ParquetRecord] Cannot open file {}: {}", file_path, e);
+            eprintln!("[ParquetReader] Cannot open file {}: {}", file_path, e);
             return None;
         }
     };
 
-    // 2. Create the ParquetRecordBatchReader with column projection to read only the specified column
     let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!(
-                "[ParquetRecordColReader] Cannot create ParquetRecordBatchReaderBuilder: {}",
-                e
-            );
+            eprintln!("[ParquetReader] Cannot create reader: {}", e);
             return None;
         }
     };
@@ -558,7 +489,6 @@ where
     let metadata = builder.metadata();
     let total_rows = metadata.file_metadata().num_rows() as usize;
 
-    // Project to read only the specified column
     let column_indices: Vec<usize> = builder
         .parquet_schema()
         .columns()
@@ -574,42 +504,32 @@ where
         .collect();
 
     if column_indices.is_empty() {
-        eprintln!(
-            "[ParquetRecordColReader] Column '{}' not found in parquet file schema",
-            column_name
-        );
+        eprintln!("[ParquetReader] Column '{}' not found in parquet file schema", column_name);
         return None;
     }
 
     let mask = ProjectionMask::roots(builder.parquet_schema(), column_indices);
     let builder = builder.with_projection(mask);
 
-    // Set the batch size and build the reader
-    let actual_batch_size = batch_size.unwrap_or_else(|| {
-        std::cmp::max(1, total_rows) // Use at least 1 as batch size
-    });
+    let actual_batch_size = batch_size.unwrap_or_else(|| std::cmp::max(1, total_rows));
     let reader = match builder.with_batch_size(actual_batch_size).build() {
         Ok(r) => r,
         Err(_e) => {
-            eprintln!("[ParquetRecordColReader] Cannot build ParquetRecordBatchReader: {_e}");
+            eprintln!("[ParquetReader] Cannot build reader: {_e}");
             return None;
         }
     };
 
     let col_name = column_name.to_string();
     let scanned_iterator = reader.scan(false, move |errored, record_batch_result| {
-        // 1. Check for previous error
         if *errored {
             return None;
         }
 
         match record_batch_result {
-            // Case A: Successful Arrow RecordBatch read
             Ok(record_batch) => {
-                // Extract the specified column from the record batch
                 let col_array = record_batch.column_by_name(&col_name)?;
 
-                // Attempt to cast to the expected primitive array type
                 if let Some(values) = col_array
                     .as_any()
                     .downcast_ref::<arrow::array::PrimitiveArray<I>>()
@@ -621,23 +541,15 @@ where
                         }
                     }
 
-                    // Return the vector of column values
                     Some(col_vec)
                 } else {
-                    // Type mismatch - could not cast to expected type
                     *errored = true;
                     None
                 }
             }
-            // Case B: Parquet I/O read error
             Err(e) => {
-                // I/O error: Log, set state to stop, and return None.
-                eprintln!(
-                    "[ParquetColReader] Parquet read error, stopping iteration: {}",
-                    e
-                );
+                eprintln!("[ParquetReader] Parquet read error: {}", e);
                 *errored = true;
-                // ⭐ STOP: Return None
                 None
             }
         }
@@ -664,14 +576,12 @@ where
 }
 
 /// Read only specified column from parquet in parallel with the provided configuration using Rayon.
-/// Each row group is read in a separate thread with its own file handle, providing true concurrent I/O.
-/// Returns a parallel iterator that the caller can continue to operate on.
 pub fn read_parquet_columns_with_config_par<I>(
     file_path: &str,
     column_name: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send)>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>)>
 where
     I: ArrowPrimitiveType + Send + Sync,
 {
@@ -679,7 +589,6 @@ where
     use rayon::prelude::*;
     use std::fs::File;
 
-    // Open file to get metadata
     let file = File::open(file_path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let metadata = builder.metadata();
@@ -692,7 +601,6 @@ where
     let iterator = (0..num_row_groups)
         .into_par_iter()
         .filter_map(move |row_group_idx| {
-            // Open file for this row group
             let file = File::open(&file_path).ok()?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
             let actual_batch_size = batch_size.unwrap_or_else(|| {
@@ -733,12 +641,11 @@ where
 
 
 /// Read only specified column from parquet in parallel with default configuration (verbose enabled) using Rayon.
-/// Returns a parallel iterator that the caller can continue to operate on.
 pub fn read_parquet_columns_par<I>(
     file_path: &str,
     column_name: &str,
     batch_size: Option<usize>,
-) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send)>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>)>
 where
     I: ArrowPrimitiveType + Sync + Send,
 {
@@ -751,8 +658,6 @@ where
 }
 
 /// Read parquet in parallel with the provided configuration using Rayon.
-/// Each row group is read in a separate thread with its own file handle, providing true concurrent I/O.
-/// Returns a vector of results that can be converted to a parallel iterator.
 pub fn read_parquet_with_config_par<T>(
     _schema: Arc<Schema>,
     file_path: &str,
@@ -774,10 +679,8 @@ where
 
     let iterator = row_group_indices
         .into_par_iter()
-        // Step 1: try to create a reader; skip failed ones
         .filter_map(move |row_group_idx| RowGroupReader::new(row_group_idx, &file_path, batch_size))
-        // Step 2: flatten each reader into its batches
-        .flat_map(|reader| reader);  // reader: RowGroupReader<T> implements ParallelIterator<Item=Vec<T>>
+        .flat_map(|reader| reader);
 
     Some((total_rows, iterator))
 }
@@ -816,9 +719,7 @@ impl<T: ParquetRecord> ParallelIterator for RowGroupReader<T> {
     where
         C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>
     {
-        // Create the parallel iterator we want to delegate to
         let par_iter = self.reader
-            .into_iter()
             .par_bridge()
             .filter_map(process_batch_result::<T>);
 
@@ -838,7 +739,6 @@ fn process_batch_result<T: ParquetRecord>(
 
 
 /// Read parquet in parallel with default configuration (verbose enabled) using Rayon.
-/// Returns a vector of results that can be converted to a parallel iterator.
 pub fn read_parquet_par<T>(
     schema: Arc<Schema>,
     file_path: &str,
@@ -946,7 +846,6 @@ mod tests {
 
     #[test]
     fn test_mb_logging() {
-        // Test that MB logging works properly by creating a writer with verbose config
         let config = ParquetRecordConfig::with_verbose(true);
         let writer = ParquetBatchWriter::<TestRecord>::with_config(
             "test_mb_logging.parquet".to_string(),
@@ -954,7 +853,6 @@ mod tests {
             config,
         );
 
-        // Add some test items to trigger verbose logging
         let test_items = vec![
             TestRecord {
                 id: 1,
@@ -973,14 +871,12 @@ mod tests {
         writer.add_items(test_items).unwrap();
         writer.close().unwrap();
 
-        // Clean up test file
         use std::fs;
         let _ = fs::remove_file("test_mb_logging.parquet");
     }
 
     #[test]
     fn test_read_parquet_columns_par() {
-        // Create a dummy parquet file
         let path = "test_read_columns_par.parquet";
         let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(10));
         let items = vec![
@@ -1000,26 +896,23 @@ mod tests {
         writer.add_items(items).unwrap();
         writer.close().unwrap();
 
-        // Read only the "id" column in parallel
         let results = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(10));
         assert!(results.is_some());
 
         let (num_rows, iter) = results.unwrap();
         let all_ids: Vec<i32> = iter.into_par_iter().flatten().collect();
         assert_eq!(all_ids.len(), 3);
-        assert_eq!(num_rows, 3); // Check that the reported row count is correct
+        assert_eq!(num_rows, 3);
         assert!(all_ids.contains(&1));
         assert!(all_ids.contains(&2));
         assert!(all_ids.contains(&3));
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_all_functions_comprehensive() {
-        // Create test data
         let path = "test_comprehensive.parquet";
         let test_items = vec![
             TestRecord { id: 1, value: "value1".to_string() },
@@ -1029,93 +922,82 @@ mod tests {
             TestRecord { id: 5, value: "value5".to_string() },
         ];
 
-        // Test ParquetBatchWriter functionality
         let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
         writer.add_items(test_items.clone()).unwrap();
-        writer.flush().unwrap();  // Ensure all items are written to update stats properly
+        writer.flush().unwrap();
 
-        // Get writer stats before closing
         let writer_stats = writer.get_stats().unwrap();
         writer.close().unwrap();
 
-        // Test read_parquet (Sequential reading with default config)
         let (num_rows, read_iter) = read_parquet(TestRecord::schema(), path, Some(2))
             .unwrap();
         let read_items: Vec<TestRecord> = read_iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items.len(), 5);
-        assert_eq!(num_rows, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows, 5);
         for (i, item) in test_items.iter().enumerate() {
             assert_eq!(read_items[i].id, item.id);
             assert_eq!(read_items[i].value, item.value);
         }
 
-        // Test read_parquet_with_config
         let config = ParquetRecordConfig::with_verbose(false);
         let (num_rows_config, read_iter_config) = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
             .unwrap();
         let read_items_config: Vec<TestRecord> = read_iter_config
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items_config.len(), 5);
-        assert_eq!(num_rows_config, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_config, 5);
 
-        // Test read_parquet_columns (Sequential column reading)
         let (num_rows_col, col_iter) = read_parquet_columns::<arrow::datatypes::Int32Type>(path, "id", Some(2))
             .unwrap();
         let id_values: Vec<i32> = col_iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(id_values.len(), 5);
-        assert_eq!(num_rows_col, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_col, 5);
         assert!(id_values.contains(&1));
         assert!(id_values.contains(&2));
         assert!(id_values.contains(&3));
         assert!(id_values.contains(&4));
         assert!(id_values.contains(&5));
 
-        // Test read_parquet_columns_with_config
         let (num_rows_col_config, col_iter_config) = read_parquet_columns_with_config::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
             .unwrap();
         let id_values_config: Vec<i32> = col_iter_config
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(id_values_config.len(), 5);
-        assert_eq!(num_rows_col_config, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_col_config, 5);
 
-        // Test read_parquet_par (Parallel reading)
         let (num_rows_par, par_iter) = read_parquet_par(TestRecord::schema(), path, Some(2))
             .unwrap();
-        let flat_par_items: Vec<TestRecord> = par_iter.flat_map(|batch| batch).collect();
+        let flat_par_items: Vec<TestRecord> = par_iter.flatten().collect();
         assert_eq!(flat_par_items.len(), 5);
-        assert_eq!(num_rows_par, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_par, 5);
 
-        // Test read_parquet_with_config_par (Parallel reading with config)
         let (num_rows_par_config, par_iter_config) = read_parquet_with_config_par(TestRecord::schema(), path, Some(2), &config)
             .unwrap();
-        let flat_par_items_config: Vec<TestRecord> = par_iter_config.flat_map(|batch| batch).collect();
+        let flat_par_items_config: Vec<TestRecord> = par_iter_config.flatten().collect();
         assert_eq!(flat_par_items_config.len(), 5);
-        assert_eq!(num_rows_par_config, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_par_config, 5);
 
-        // Test read_parquet_columns_par (Parallel column reading)
         let (num_rows_col_par, col_par_iter) = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(2))
             .unwrap();
-        let flat_par_col_values: Vec<i32> = col_par_iter.flat_map(|batch| batch).collect();
+        let flat_par_col_values: Vec<i32> = col_par_iter.flatten().collect();
         assert_eq!(flat_par_col_values.len(), 5);
-        assert_eq!(num_rows_col_par, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_col_par, 5);
 
-        // Test read_parquet_columns_with_config_par (Parallel column reading with config)
         let (num_rows_col_par_config, col_par_iter_config) = read_parquet_columns_with_config_par::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
             .unwrap();
-        let flat_par_col_values_config: Vec<i32> = col_par_iter_config.flat_map(|batch| batch).collect();
+        let flat_par_col_values_config: Vec<i32> = col_par_iter_config.flatten().collect();
         assert_eq!(flat_par_col_values_config.len(), 5);
-        assert_eq!(num_rows_col_par_config, 5); // Check that the reported row count is correct
+        assert_eq!(num_rows_col_par_config, 5);
 
         assert_eq!(writer_stats.total_items_written, 5);
         assert!(writer_stats.total_bytes_written > 0);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1124,10 +1006,8 @@ mod tests {
     fn test_buffer_operations() {
         let path = "test_buffer.parquet";
 
-        // Test with small buffer to trigger swapping
         let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
 
-        // Add items one by one to test add_item
         for i in 1..=5 {
             writer.add_item(TestRecord {
                 id: i,
@@ -1135,30 +1015,25 @@ mod tests {
             }).unwrap();
         }
 
-        // Add some more with add_items
         let more_items = vec![
             TestRecord { id: 6, value: "item6".to_string() },
             TestRecord { id: 7, value: "item7".to_string() },
         ];
         writer.add_items(more_items).unwrap();
 
-        // Get the buffer length before closing
         let buffer_len_before_close = writer.buffer_len();
         writer.close().unwrap();
 
-        // Verify we can read back all items
         let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(3))
             .unwrap();
         let read_items: Vec<TestRecord> = iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items.len(), 7);
-        assert_eq!(num_rows, 7); // Check that the reported row count is correct
+        assert_eq!(num_rows, 7);
 
-        // Test buffer operations - with 7 items and buffer size 2, buffer should have 1 item remaining
-        assert_eq!(buffer_len_before_close, 1); // Buffer has remaining items that haven't been flushed yet
+        assert_eq!(buffer_len_before_close, 1);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1167,15 +1042,12 @@ mod tests {
     fn test_edge_cases() {
         let path = "test_edge.parquet";
 
-        // Test with empty data
         let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5));
         writer.close().unwrap();
 
-        // Reading empty file should return None (no data to read)
         let empty_reader = read_parquet::<TestRecord>(TestRecord::schema(), path, Some(2));
-        assert!(empty_reader.is_none());  // No data to read means no iterator
+        assert!(empty_reader.is_none());
 
-        // Test with single item
         let single_path = "test_single.parquet";
         let single_writer = ParquetBatchWriter::<TestRecord>::new(single_path.to_string(), Some(5));
         single_writer.add_item(TestRecord { id: 42, value: "single".to_string() }).unwrap();
@@ -1184,17 +1056,16 @@ mod tests {
         let (single_num_rows, single_iter): (usize, _) = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
             .unwrap();
         let single_items: Vec<TestRecord> = single_iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(single_items.len(), 1);
-        assert_eq!(single_num_rows, 1); // Check that the reported row count is correct
+        assert_eq!(single_num_rows, 1);
         assert_eq!(single_items[0].id, 42);
         assert_eq!(single_items[0].value, "single");
 
-        // Clean up
         use std::fs;
-        let _ = fs::remove_file(path);      // Ignore error if file doesn't exist
-        let _ = fs::remove_file(single_path); // Ignore error if file doesn't exist
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(single_path);
     }
 
     #[test]
@@ -1211,15 +1082,14 @@ mod tests {
         ];
 
         writer.add_items(items).unwrap();
-        writer.flush().unwrap();  // Ensure all items in buffer are written
+        writer.flush().unwrap();
         let stats = writer.get_stats().unwrap();
         writer.close().unwrap();
 
         assert_eq!(stats.total_items_written, 4);
         assert!(stats.total_bytes_written > 0);
-        assert!(stats.total_batches_written >= 1);  // Should be at least 1 batch, maybe 2 depending on buffering
+        assert!(stats.total_batches_written >= 1);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1228,32 +1098,27 @@ mod tests {
     fn test_flush_operation() {
         let path = "test_flush.parquet";
 
-        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(10));  // Large buffer
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(10));
 
-        // Add some items
         for i in 1..=3 {
             writer.add_item(TestRecord { id: i, value: format!("item{}", i) }).unwrap();
         }
 
-        // Buffer should have items
         assert_eq!(writer.buffer_len(), 3);
 
-        // Flush the buffer
         writer.flush().unwrap();
         assert_eq!(writer.buffer_len(), 0);
 
         writer.close().unwrap();
 
-        // Verify items were written
         let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(2))
             .unwrap();
         let items: Vec<TestRecord> = iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(items.len(), 3);
-        assert_eq!(num_rows, 3); // Check that the reported row count is correct
+        assert_eq!(num_rows, 3);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1262,7 +1127,6 @@ mod tests {
     fn test_verbose_logging_functionality() {
         let path = "test_verbose.parquet";
 
-        // Test with verbose logging enabled
         let config = ParquetRecordConfig::with_verbose(true);
         let writer = ParquetBatchWriter::<TestRecord>::with_config(
             path.to_string(),
@@ -1278,16 +1142,14 @@ mod tests {
         writer.add_items(items).unwrap();
         writer.close().unwrap();
 
-        // Verify items were written
         let (num_rows, iter) = read_parquet(TestRecord::schema(), path, None)
             .unwrap();
         let read_items: Vec<TestRecord> = iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items.len(), 2);
-        assert_eq!(num_rows, 2); // Check that the reported row count is correct
+        assert_eq!(num_rows, 2);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1296,7 +1158,6 @@ mod tests {
     fn test_read_parquet_sequential() {
         let path = "test_read_seq.parquet";
 
-        // Create test data
         let items = vec![
             TestRecord { id: 10, value: "first".to_string() },
             TestRecord { id: 20, value: "second".to_string() },
@@ -1308,44 +1169,39 @@ mod tests {
         writer.add_items(items.clone()).unwrap();
         writer.close().unwrap();
 
-        // Test read_parquet with different batch sizes
         for batch_size in [1, 2, 3, 4, 10] {
             let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(batch_size))
                 .unwrap();
             let read_items: Vec<TestRecord> = iter
-                .flat_map(|batch| batch)
+                .flatten()
                 .collect();
 
             assert_eq!(read_items.len(), 4);
-            assert_eq!(num_rows, 4); // Check that the reported row count is correct
+            assert_eq!(num_rows, 4);
 
-            // Check that all original items are present
             for (i, original_item) in items.iter().enumerate() {
                 assert_eq!(read_items[i].id, original_item.id);
                 assert_eq!(read_items[i].value, original_item.value);
             }
         }
 
-        // Test with default batch size (None)
         let (num_rows_default, iter_default) = read_parquet(TestRecord::schema(), path, None)
             .unwrap();
         let read_items_default: Vec<TestRecord> = iter_default
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items_default.len(), 4);
-        assert_eq!(num_rows_default, 4); // Check that the reported row count is correct
+        assert_eq!(num_rows_default, 4);
 
-        // Test with configuration
         let config = ParquetRecordConfig::with_verbose(false);
         let (num_rows_config, iter_config) = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
             .unwrap();
         let read_items_config: Vec<TestRecord> = iter_config
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(read_items_config.len(), 4);
-        assert_eq!(num_rows_config, 4); // Check that the reported row count is correct
+        assert_eq!(num_rows_config, 4);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1354,26 +1210,22 @@ mod tests {
     fn test_read_parquet_parallel() {
         let path = "test_read_par.parquet";
 
-        // Create test data with multiple items to test different scenarios
         let items: Vec<TestRecord> = (1..=20).map(|i| TestRecord {
             id: i,
             value: format!("item{}", i),
         }).collect();
 
-        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5)); // Buffer size 5
+        let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5));
         writer.add_items(items.clone()).unwrap();
         writer.close().unwrap();
 
-        // Test read_parquet_par - getting individual batches
         let (par_num_rows, par_iter) = read_parquet_par(TestRecord::schema(), path, Some(3))
             .unwrap();
 
-        // Verify total count by collecting all items
-        let all_items: Vec<TestRecord> = par_iter.flat_map(|batch| batch).collect();
+        let all_items: Vec<TestRecord> = par_iter.flatten().collect();
         assert_eq!(all_items.len(), 20);
-        assert_eq!(par_num_rows, 20); // Check that the reported row count is correct
+        assert_eq!(par_num_rows, 20);
 
-        // Sort both vectors by ID to compare (parallel processing order may vary)
         let mut all_items_sorted = all_items;
         all_items_sorted.sort_by(|a, b| a.id.cmp(&b.id));
         let mut items_sorted = items.clone();
@@ -1384,15 +1236,13 @@ mod tests {
             assert_eq!(all_items_sorted[i].value, items_sorted[i].value);
         }
 
-        // Test with configuration
         let config = ParquetRecordConfig::with_verbose(false);
         let (par_num_rows_config, par_iter_config) = read_parquet_with_config_par::<TestRecord>(TestRecord::schema(), path, Some(3), &config)
             .unwrap();
-        let total_items_config: usize = par_iter_config.flat_map(|batch| batch).count();
+        let total_items_config: usize = par_iter_config.flatten().count();
         assert_eq!(total_items_config, 20);
-        assert_eq!(par_num_rows_config, 20); // Check that the reported row count is correct
+        assert_eq!(par_num_rows_config, 20);
 
-        // Clean up
         use std::fs;
         fs::remove_file(path).unwrap();
     }
@@ -1401,43 +1251,36 @@ mod tests {
     fn test_read_parquet_edge_cases() {
         let empty_path = "test_read_empty.parquet";
 
-        // Create empty file
         let empty_writer = ParquetBatchWriter::<TestRecord>::new(empty_path.to_string(), Some(5));
         empty_writer.close().unwrap();
 
-        // Test empty file with sequential reader
         let empty_result = read_parquet::<TestRecord>(TestRecord::schema(), empty_path, Some(2));
-        assert!(empty_result.is_none()); // No data means no iterator
+        assert!(empty_result.is_none());
 
-        // Test empty file with parallel reader
         let empty_par_result = read_parquet_par::<TestRecord>(TestRecord::schema(), empty_path, Some(2));
-        assert!(empty_par_result.is_none()); // No data means no iterator
+        assert!(empty_par_result.is_none());
 
-        // Test single item
         let single_path = "test_read_single.parquet";
         let single_writer = ParquetBatchWriter::<TestRecord>::new(single_path.to_string(), Some(5));
         single_writer.add_item(TestRecord { id: 100, value: "single_item".to_string() }).unwrap();
         single_writer.close().unwrap();
 
-        // Test single item with sequential reader
         let (single_num_rows, single_iter) = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
             .unwrap();
         let single_items: Vec<TestRecord> = single_iter
-            .flat_map(|batch| batch)
+            .flatten()
             .collect();
         assert_eq!(single_items.len(), 1);
-        assert_eq!(single_num_rows, 1); // Check that the reported row count is correct
+        assert_eq!(single_num_rows, 1);
         assert_eq!(single_items[0].id, 100);
         assert_eq!(single_items[0].value, "single_item");
 
-        // Test single item with parallel reader
         let (single_par_num_rows, single_par_iter) = read_parquet_par::<TestRecord>(TestRecord::schema(), single_path, Some(2))
             .unwrap();
-        let total_single_items: usize = single_par_iter.flat_map(|batch| batch).count();
+        let total_single_items: usize = single_par_iter.flatten().count();
         assert_eq!(total_single_items, 1);
-        assert_eq!(single_par_num_rows, 1); // Check that the reported row count is correct
+        assert_eq!(single_par_num_rows, 1);
 
-        // Clean up
         use std::fs;
         let _ = fs::remove_file(empty_path);
         let _ = fs::remove_file(single_path);
