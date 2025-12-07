@@ -16,8 +16,9 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
     - name: Get crate version first
       id: version
+      working-directory: ./src/parquet-record
       run: |
-        VERSION=$(grep -E "^version = " src/parquet-record/Cargo.toml | head -n1 | cut -d '"' -f2)
+        VERSION=$(grep -E "^version = " Cargo.toml | head -n1 | cut -d '"' -f2)
         echo "current_version=$VERSION" >> $GITHUB_OUTPUT
         echo "Attempting to publish version: $VERSION"
     - name: Run tests
@@ -36,10 +37,17 @@ jobs:
       run: |
         cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
       if: steps.check_token.outputs.has_token == 'true'
-    - name: Publish to crates.io
+    - name: Publish to crates.io and create Git tag if successful
       working-directory: ./src/parquet-record
       run: |
-        cargo publish || echo "Publish failed - likely because this version was already published"
+        # Attempt to publish - only create git tag if successful
+        if cargo publish; then
+          echo "PUBLISH_SUCCESS=true" >> $GITHUB_ENV
+          echo "Successfully published to crates.io"
+        else
+          echo "PUBLISH_SUCCESS=false" >> $GITHUB_ENV
+          echo "Publish failed - likely because version already exists on crates.io"
+        fi
       if: steps.check_token.outputs.has_token == 'true'
     - name: Create Git tag
       run: |
@@ -47,4 +55,4 @@ jobs:
         git config --local user.name "GitHub Action"
         git tag -a v${{ steps.version.outputs.current_version }} -m "Release version ${{ steps.version.outputs.current_version }}"
         git push origin v${{ steps.version.outputs.current_version }}
-      if: steps.check_token.outputs.has_token == 'true'
+      if: env.PUBLISH_SUCCESS == 'true'
