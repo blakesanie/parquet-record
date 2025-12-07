@@ -9,10 +9,10 @@ use rayon::iter::ParallelBridge; // ⬅️ The fix for E0412
 use rayon::iter::FilterMap;
 use std::fs::File;
 use std::{fs, io};
-use std::io::BufWriter;
+use std::io::{BufWriter, ErrorKind};
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Configuration for parquet record operations.
@@ -98,7 +98,7 @@ pub struct ParquetBatchWriter<T: ParquetRecord + Clone> {
     output_file: String,
     config: ParquetRecordConfig,
     stats: Mutex<WriteStats>,
-    closed: AtomicBool,
+    closed: RwLock<bool>,
 }
 
 impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
@@ -120,13 +120,17 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             output_file,
             config,
             stats: Mutex::new(WriteStats::default()),
-            closed: AtomicBool::new(false),
+            closed: RwLock::new(false),
         }
     }
 
     /// Adds items to the buffer. If the buffer exceeds the specified size,
     /// it will be swapped with a secondary buffer and written to disk on the same thread.
     pub fn add_items(&self, items: Vec<T>) -> Result<(), io::Error> {
+        let closed_guard = self.closed.read().unwrap();
+        if *closed_guard {
+            return Err(io::Error::new(ErrorKind::Other, "already closed"));
+        }
         if self.buffer_size == usize::MAX {
             // No buffer size limit - just add to buffer
             let mut buffer_guard = self
@@ -175,6 +179,10 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
     }
 
     pub fn add_item(&self, item: T) -> Result<(), io::Error> {
+        let closed_guard = self.closed.read().unwrap();
+        if *closed_guard {
+            return Err(io::Error::new(ErrorKind::Other, "already closed"));
+        }
         if self.buffer_size == usize::MAX {
             // No buffer size limit - just add to buffer
             let mut buffer_guard = self
@@ -341,9 +349,13 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
 
     /// Closes the writer and finalizes the file
     pub fn close_no_consume(&self) -> Result<(), io::Error> {
-        let already_closed = self.closed.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err();
-        if already_closed {
-            return Ok(());
+        let mut closed_guard = self.closed.write().unwrap();
+        if *closed_guard {
+            return Ok(())
+        }
+        *closed_guard = true;
+        if self.output_file.ends_with("5_8_12.parquet") {
+            dbg!();
         }
         // Flush any remaining items
         self.flush()?;
