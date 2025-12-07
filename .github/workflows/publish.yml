@@ -28,16 +28,13 @@ jobs:
       run: |
         cd src/parquet-record
         cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      if: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     - name: Publish to crates.io
       run: |
         cd src/parquet-record
-        cargo publish || echo "Publish failed - likely because this version was already published"
-      if: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        cargo publish || echo "Publish failed - likely because this version was already published or no token available"
     - name: Create Git tag
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git tag -a v${{ steps.version.outputs.current_version }} -m "Release version ${{ steps.version.outputs.current_version }}"
         git push origin v${{ steps.version.outputs.current_version }}
-      if: ${{ secrets.CARGO_REGISTRY_TOKEN }}
