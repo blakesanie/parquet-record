@@ -71,11 +71,13 @@ fn test_read_columns() {
     let reader = read_parquet_columns::<arrow::datatypes::Int32Type>(path, "id", Some(10));
     assert!(reader.is_some());
 
+    let (num_rows, iter) = reader.unwrap();
     let mut count = 0;
-    for array_result in reader.unwrap() {
+    for array_result in iter {
         count += array_result.len();
     }
     assert_eq!(count, 2);
+    assert_eq!(num_rows, 2); // Check that the reported row count is correct
 
     // Clean up
     std::fs::remove_file(path).unwrap();

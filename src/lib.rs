@@ -300,7 +300,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             let total_mb_written =
                 (stats_guard.total_bytes_written as f64 / (1024.0 * 1024.0)).ceil() as usize;
             println!(
-                "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}/{}) Total: {} MB",
+                "[ParquetWriter {}] Wrote batch of {} items ({} MB) (batch #{}) Total: {} records / {} MB",
                 self.output_file,
                 buffer.items.len(),
                 mb_written,
@@ -429,7 +429,7 @@ pub fn read_parquet_with_config<T>(
     file_path: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<impl Iterator<Item = Vec<T>>>
+) -> Option<(usize, impl Iterator<Item = Vec<T>>)>
 where
     T: ParquetRecord,
 {
@@ -452,10 +452,11 @@ where
     };
 
     let metadata = builder.metadata();
+    let total_rows = metadata.file_metadata().num_rows() as usize;
 
     // Set the batch size to the provided value, or use the default from the reader if not specified
     let actual_batch_size = batch_size.unwrap_or_else(|| {
-        std::cmp::max(1, metadata.file_metadata().num_rows() as usize) // Use at least 1 as batch size
+        std::cmp::max(1, total_rows) // Use at least 1 as batch size
     });
     let reader = match builder.with_batch_size(actual_batch_size).build() {
         Ok(r) => r,
@@ -500,7 +501,7 @@ where
         }
     });
 
-    Some(scanned_iterator)
+    Some((total_rows, scanned_iterator))
 }
 
 /// Read parquet file with default configuration (verbose enabled).
@@ -508,7 +509,7 @@ pub fn read_parquet<T>(
     schema: Arc<Schema>,
     file_path: &str,
     batch_size: Option<usize>,
-) -> Option<impl Iterator<Item = Vec<T>>>
+) -> Option<(usize, impl Iterator<Item = Vec<T>>)>
 where
     T: ParquetRecord,
 {
@@ -528,7 +529,7 @@ pub fn read_parquet_columns_with_config<I>(
     column_name: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
+) -> Option<(usize, impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>)>
 where
     I: ArrowPrimitiveType,
 {
@@ -553,6 +554,9 @@ where
             return None;
         }
     };
+
+    let metadata = builder.metadata();
+    let total_rows = metadata.file_metadata().num_rows() as usize;
 
     // Project to read only the specified column
     let column_indices: Vec<usize> = builder
@@ -582,8 +586,7 @@ where
 
     // Set the batch size and build the reader
     let actual_batch_size = batch_size.unwrap_or_else(|| {
-        let metadata = builder.metadata();
-        std::cmp::max(1, metadata.file_metadata().num_rows() as usize) // Use at least 1 as batch size
+        std::cmp::max(1, total_rows) // Use at least 1 as batch size
     });
     let reader = match builder.with_batch_size(actual_batch_size).build() {
         Ok(r) => r,
@@ -640,7 +643,7 @@ where
         }
     });
 
-    Some(scanned_iterator)
+    Some((total_rows, scanned_iterator))
 }
 
 /// Read only specified column from parquet file with default configuration (verbose enabled).
@@ -648,7 +651,7 @@ pub fn read_parquet_columns<I>(
     file_path: &str,
     column_name: &str,
     batch_size: Option<usize>,
-) -> Option<impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>>
+) -> Option<(usize, impl Iterator<Item = Vec<<I as ArrowPrimitiveType>::Native>>)>
 where
     I: ArrowPrimitiveType,
 {
@@ -668,7 +671,7 @@ pub fn read_parquet_columns_with_config_par<I>(
     column_name: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send)>
 where
     I: ArrowPrimitiveType + Send + Sync,
 {
@@ -680,51 +683,52 @@ where
     let file = File::open(file_path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let metadata = builder.metadata();
+    let total_rows = metadata.file_metadata().num_rows() as usize;
     let num_row_groups = metadata.num_row_groups();
 
     let file_path = file_path.to_string();
     let column_name = column_name.to_string();
 
-    Some(
-        (0..num_row_groups)
-            .into_par_iter()
-            .filter_map(move |row_group_idx| {
-                // Open file for this row group
-                let file = File::open(&file_path).ok()?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
-                let actual_batch_size = batch_size.unwrap_or_else(|| {
-                    std::cmp::max(1, builder.metadata().file_metadata().num_rows() as usize)
-                });
+    let iterator = (0..num_row_groups)
+        .into_par_iter()
+        .filter_map(move |row_group_idx| {
+            // Open file for this row group
+            let file = File::open(&file_path).ok()?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+            let actual_batch_size = batch_size.unwrap_or_else(|| {
+                std::cmp::max(1, builder.metadata().file_metadata().num_rows() as usize)
+            });
 
-                let reader = builder
-                    .with_batch_size(actual_batch_size)
-                    .with_row_groups(vec![row_group_idx])
-                    .build()
-                    .ok()?;
+            let reader = builder
+                .with_batch_size(actual_batch_size)
+                .with_row_groups(vec![row_group_idx])
+                .build()
+                .ok()?;
 
-                let mut all_column_values = Vec::new();
+            let mut all_column_values = Vec::new();
 
-                for batch_result in reader {
-                    let batch = batch_result.ok()?;
-                    let col_array = batch.column_by_name(&column_name)?;
-                    let values = col_array
-                        .as_any()
-                        .downcast_ref::<arrow::array::PrimitiveArray<I>>()?;
+            for batch_result in reader {
+                let batch = batch_result.ok()?;
+                let col_array = batch.column_by_name(&column_name)?;
+                let values = col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::PrimitiveArray<I>>()?;
 
-                    for i in 0..values.len() {
-                        if !values.is_null(i) {
-                            all_column_values.push(values.value(i));
-                        }
+                for i in 0..values.len() {
+                    if !values.is_null(i) {
+                        all_column_values.push(values.value(i));
                     }
                 }
+            }
 
-                if all_column_values.is_empty() {
-                    None
-                } else {
-                    Some(all_column_values)
-                }
-            }),
-    )
+            if all_column_values.is_empty() {
+                None
+            } else {
+                Some(all_column_values)
+            }
+        });
+
+    Some((total_rows, iterator))
 }
 
 
@@ -734,7 +738,7 @@ pub fn read_parquet_columns_par<I>(
     file_path: &str,
     column_name: &str,
     batch_size: Option<usize>,
-) -> Option<impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<<I as ArrowPrimitiveType>::Native>> + Send)>
 where
     I: ArrowPrimitiveType + Sync + Send,
 {
@@ -754,27 +758,28 @@ pub fn read_parquet_with_config_par<T>(
     file_path: &str,
     batch_size: Option<usize>,
     _config: &ParquetRecordConfig,
-) -> Option<impl ParallelIterator<Item = Vec<T>>>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<T>>)>
 where
     T: ParquetRecord + 'static,
 {
     let file = File::open(file_path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let metadata = builder.metadata();
+    let total_rows = metadata.file_metadata().num_rows() as usize;
     let num_row_groups = metadata.num_row_groups();
 
     let row_group_indices = 0..num_row_groups;
 
     let file_path = file_path.to_string();
 
-    Some(
-        row_group_indices
-            .into_par_iter()
-            // Step 1: try to create a reader; skip failed ones
-            .filter_map(move |row_group_idx| RowGroupReader::new(row_group_idx, &file_path, batch_size))
-            // Step 2: flatten each reader into its batches
-            .flat_map(|reader| reader)  // reader: RowGroupReader<T> implements ParallelIterator<Item=Vec<T>>
-    )
+    let iterator = row_group_indices
+        .into_par_iter()
+        // Step 1: try to create a reader; skip failed ones
+        .filter_map(move |row_group_idx| RowGroupReader::new(row_group_idx, &file_path, batch_size))
+        // Step 2: flatten each reader into its batches
+        .flat_map(|reader| reader);  // reader: RowGroupReader<T> implements ParallelIterator<Item=Vec<T>>
+
+    Some((total_rows, iterator))
 }
 
 pub struct RowGroupReader<T: ParquetRecord> {
@@ -838,7 +843,7 @@ pub fn read_parquet_par<T>(
     schema: Arc<Schema>,
     file_path: &str,
     batch_size: Option<usize>,
-) -> Option<impl ParallelIterator<Item = Vec<T>>>
+) -> Option<(usize, impl ParallelIterator<Item = Vec<T>>)>
 where
     T: ParquetRecord + 'static,
 {
@@ -999,9 +1004,10 @@ mod tests {
         let results = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(10));
         assert!(results.is_some());
 
-        let unwrapped_results = results.unwrap();
-        let all_ids: Vec<i32> = unwrapped_results.into_par_iter().flatten().collect();
+        let (num_rows, iter) = results.unwrap();
+        let all_ids: Vec<i32> = iter.into_par_iter().flatten().collect();
         assert_eq!(all_ids.len(), 3);
+        assert_eq!(num_rows, 3); // Check that the reported row count is correct
         assert!(all_ids.contains(&1));
         assert!(all_ids.contains(&2));
         assert!(all_ids.contains(&3));
@@ -1033,11 +1039,13 @@ mod tests {
         writer.close().unwrap();
 
         // Test read_parquet (Sequential reading with default config)
-        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(2))
-            .unwrap()
+        let (num_rows, read_iter) = read_parquet(TestRecord::schema(), path, Some(2))
+            .unwrap();
+        let read_items: Vec<TestRecord> = read_iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items.len(), 5);
+        assert_eq!(num_rows, 5); // Check that the reported row count is correct
         for (i, item) in test_items.iter().enumerate() {
             assert_eq!(read_items[i].id, item.id);
             assert_eq!(read_items[i].value, item.value);
@@ -1045,18 +1053,22 @@ mod tests {
 
         // Test read_parquet_with_config
         let config = ParquetRecordConfig::with_verbose(false);
-        let read_items_config: Vec<TestRecord> = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
-            .unwrap()
+        let (num_rows_config, read_iter_config) = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
+            .unwrap();
+        let read_items_config: Vec<TestRecord> = read_iter_config
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items_config.len(), 5);
+        assert_eq!(num_rows_config, 5); // Check that the reported row count is correct
 
         // Test read_parquet_columns (Sequential column reading)
-        let id_values: Vec<i32> = read_parquet_columns::<arrow::datatypes::Int32Type>(path, "id", Some(2))
-            .unwrap()
+        let (num_rows_col, col_iter) = read_parquet_columns::<arrow::datatypes::Int32Type>(path, "id", Some(2))
+            .unwrap();
+        let id_values: Vec<i32> = col_iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(id_values.len(), 5);
+        assert_eq!(num_rows_col, 5); // Check that the reported row count is correct
         assert!(id_values.contains(&1));
         assert!(id_values.contains(&2));
         assert!(id_values.contains(&3));
@@ -1064,35 +1076,41 @@ mod tests {
         assert!(id_values.contains(&5));
 
         // Test read_parquet_columns_with_config
-        let id_values_config: Vec<i32> = read_parquet_columns_with_config::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
-            .unwrap()
+        let (num_rows_col_config, col_iter_config) = read_parquet_columns_with_config::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
+            .unwrap();
+        let id_values_config: Vec<i32> = col_iter_config
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(id_values_config.len(), 5);
+        assert_eq!(num_rows_col_config, 5); // Check that the reported row count is correct
 
         // Test read_parquet_par (Parallel reading)
-        let par_items = read_parquet_par(TestRecord::schema(), path, Some(2))
+        let (num_rows_par, par_iter) = read_parquet_par(TestRecord::schema(), path, Some(2))
             .unwrap();
-        let flat_par_items: Vec<TestRecord> = par_items.flat_map(|batch| batch).collect();
+        let flat_par_items: Vec<TestRecord> = par_iter.flat_map(|batch| batch).collect();
         assert_eq!(flat_par_items.len(), 5);
+        assert_eq!(num_rows_par, 5); // Check that the reported row count is correct
 
         // Test read_parquet_with_config_par (Parallel reading with config)
-        let par_items_config = read_parquet_with_config_par(TestRecord::schema(), path, Some(2), &config)
+        let (num_rows_par_config, par_iter_config) = read_parquet_with_config_par(TestRecord::schema(), path, Some(2), &config)
             .unwrap();
-        let flat_par_items_config: Vec<TestRecord> = par_items_config.flat_map(|batch| batch).collect();
+        let flat_par_items_config: Vec<TestRecord> = par_iter_config.flat_map(|batch| batch).collect();
         assert_eq!(flat_par_items_config.len(), 5);
+        assert_eq!(num_rows_par_config, 5); // Check that the reported row count is correct
 
         // Test read_parquet_columns_par (Parallel column reading)
-        let par_col_values = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(2))
+        let (num_rows_col_par, col_par_iter) = read_parquet_columns_par::<arrow::datatypes::Int32Type>(path, "id", Some(2))
             .unwrap();
-        let flat_par_col_values: Vec<i32> = par_col_values.flat_map(|batch| batch).collect();
+        let flat_par_col_values: Vec<i32> = col_par_iter.flat_map(|batch| batch).collect();
         assert_eq!(flat_par_col_values.len(), 5);
+        assert_eq!(num_rows_col_par, 5); // Check that the reported row count is correct
 
         // Test read_parquet_columns_with_config_par (Parallel column reading with config)
-        let par_col_values_config = read_parquet_columns_with_config_par::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
+        let (num_rows_col_par_config, col_par_iter_config) = read_parquet_columns_with_config_par::<arrow::datatypes::Int32Type>(path, "id", Some(2), &config)
             .unwrap();
-        let flat_par_col_values_config: Vec<i32> = par_col_values_config.flat_map(|batch| batch).collect();
+        let flat_par_col_values_config: Vec<i32> = col_par_iter_config.flat_map(|batch| batch).collect();
         assert_eq!(flat_par_col_values_config.len(), 5);
+        assert_eq!(num_rows_col_par_config, 5); // Check that the reported row count is correct
 
         assert_eq!(writer_stats.total_items_written, 5);
         assert!(writer_stats.total_bytes_written > 0);
@@ -1129,11 +1147,13 @@ mod tests {
         writer.close().unwrap();
 
         // Verify we can read back all items
-        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(3))
-            .unwrap()
+        let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(3))
+            .unwrap();
+        let read_items: Vec<TestRecord> = iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items.len(), 7);
+        assert_eq!(num_rows, 7); // Check that the reported row count is correct
 
         // Test buffer operations - with 7 items and buffer size 2, buffer should have 1 item remaining
         assert_eq!(buffer_len_before_close, 1); // Buffer has remaining items that haven't been flushed yet
@@ -1161,11 +1181,13 @@ mod tests {
         single_writer.add_item(TestRecord { id: 42, value: "single".to_string() }).unwrap();
         single_writer.close().unwrap();
 
-        let single_items: Vec<TestRecord> = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
-            .unwrap()
+        let (single_num_rows, single_iter): (usize, _) = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+            .unwrap();
+        let single_items: Vec<TestRecord> = single_iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(single_items.len(), 1);
+        assert_eq!(single_num_rows, 1); // Check that the reported row count is correct
         assert_eq!(single_items[0].id, 42);
         assert_eq!(single_items[0].value, "single");
 
@@ -1223,11 +1245,13 @@ mod tests {
         writer.close().unwrap();
 
         // Verify items were written
-        let items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(2))
-            .unwrap()
+        let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(2))
+            .unwrap();
+        let items: Vec<TestRecord> = iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(items.len(), 3);
+        assert_eq!(num_rows, 3); // Check that the reported row count is correct
 
         // Clean up
         use std::fs;
@@ -1255,11 +1279,13 @@ mod tests {
         writer.close().unwrap();
 
         // Verify items were written
-        let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, None)
-            .unwrap()
+        let (num_rows, iter) = read_parquet(TestRecord::schema(), path, None)
+            .unwrap();
+        let read_items: Vec<TestRecord> = iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items.len(), 2);
+        assert_eq!(num_rows, 2); // Check that the reported row count is correct
 
         // Clean up
         use std::fs;
@@ -1284,12 +1310,14 @@ mod tests {
 
         // Test read_parquet with different batch sizes
         for batch_size in [1, 2, 3, 4, 10] {
-            let read_items: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, Some(batch_size))
-                .unwrap()
+            let (num_rows, iter) = read_parquet(TestRecord::schema(), path, Some(batch_size))
+                .unwrap();
+            let read_items: Vec<TestRecord> = iter
                 .flat_map(|batch| batch)
                 .collect();
 
             assert_eq!(read_items.len(), 4);
+            assert_eq!(num_rows, 4); // Check that the reported row count is correct
 
             // Check that all original items are present
             for (i, original_item) in items.iter().enumerate() {
@@ -1299,19 +1327,23 @@ mod tests {
         }
 
         // Test with default batch size (None)
-        let read_items_default: Vec<TestRecord> = read_parquet(TestRecord::schema(), path, None)
-            .unwrap()
+        let (num_rows_default, iter_default) = read_parquet(TestRecord::schema(), path, None)
+            .unwrap();
+        let read_items_default: Vec<TestRecord> = iter_default
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items_default.len(), 4);
+        assert_eq!(num_rows_default, 4); // Check that the reported row count is correct
 
         // Test with configuration
         let config = ParquetRecordConfig::with_verbose(false);
-        let read_items_config: Vec<TestRecord> = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
-            .unwrap()
+        let (num_rows_config, iter_config) = read_parquet_with_config(TestRecord::schema(), path, Some(2), &config)
+            .unwrap();
+        let read_items_config: Vec<TestRecord> = iter_config
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(read_items_config.len(), 4);
+        assert_eq!(num_rows_config, 4); // Check that the reported row count is correct
 
         // Clean up
         use std::fs;
@@ -1333,12 +1365,13 @@ mod tests {
         writer.close().unwrap();
 
         // Test read_parquet_par - getting individual batches
-        let par_batches = read_parquet_par(TestRecord::schema(), path, Some(3))
+        let (par_num_rows, par_iter) = read_parquet_par(TestRecord::schema(), path, Some(3))
             .unwrap();
 
         // Verify total count by collecting all items
-        let all_items: Vec<TestRecord> = par_batches.flat_map(|batch| batch).collect();
+        let all_items: Vec<TestRecord> = par_iter.flat_map(|batch| batch).collect();
         assert_eq!(all_items.len(), 20);
+        assert_eq!(par_num_rows, 20); // Check that the reported row count is correct
 
         // Sort both vectors by ID to compare (parallel processing order may vary)
         let mut all_items_sorted = all_items;
@@ -1353,10 +1386,11 @@ mod tests {
 
         // Test with configuration
         let config = ParquetRecordConfig::with_verbose(false);
-        let par_batches_config = read_parquet_with_config_par::<TestRecord>(TestRecord::schema(), path, Some(3), &config)
+        let (par_num_rows_config, par_iter_config) = read_parquet_with_config_par::<TestRecord>(TestRecord::schema(), path, Some(3), &config)
             .unwrap();
-        let total_items_config: usize = par_batches_config.flat_map(|batch| batch).count();
+        let total_items_config: usize = par_iter_config.flat_map(|batch| batch).count();
         assert_eq!(total_items_config, 20);
+        assert_eq!(par_num_rows_config, 20); // Check that the reported row count is correct
 
         // Clean up
         use std::fs;
@@ -1386,19 +1420,22 @@ mod tests {
         single_writer.close().unwrap();
 
         // Test single item with sequential reader
-        let single_items: Vec<TestRecord> = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
-            .unwrap()
+        let (single_num_rows, single_iter) = read_parquet::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+            .unwrap();
+        let single_items: Vec<TestRecord> = single_iter
             .flat_map(|batch| batch)
             .collect();
         assert_eq!(single_items.len(), 1);
+        assert_eq!(single_num_rows, 1); // Check that the reported row count is correct
         assert_eq!(single_items[0].id, 100);
         assert_eq!(single_items[0].value, "single_item");
 
         // Test single item with parallel reader
-        let single_par_result = read_parquet_par::<TestRecord>(TestRecord::schema(), single_path, Some(2))
+        let (single_par_num_rows, single_par_iter) = read_parquet_par::<TestRecord>(TestRecord::schema(), single_path, Some(2))
             .unwrap();
-        let total_single_items: usize = single_par_result.flat_map(|batch| batch).count();
+        let total_single_items: usize = single_par_iter.flat_map(|batch| batch).count();
         assert_eq!(total_single_items, 1);
+        assert_eq!(single_par_num_rows, 1); // Check that the reported row count is correct
 
         // Clean up
         use std::fs;
