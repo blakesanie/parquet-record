@@ -1,6 +1,6 @@
 # parquet-record
 
-A Rust library for efficient serialization and deserialization of structs to/from Parquet format with support for batch writing and parallel reading.
+A high-performance Rust library for moving structs to/from disk using Parquet format. Abstracts complex Arrow/Parquet usage while providing batch writing and parallel reading capabilities for maximum performance.
 
 ## Features
 

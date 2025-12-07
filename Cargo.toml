@@ -3,7 +3,7 @@ name = "parquet-record"
 version = "0.1.0"
 edition = "2021"
 authors = ["Blake Sanie <blake@sanie.com>"]
-description = "A Rust library for efficient serialization and deserialization of structs to/from Parquet format with support for batch writing and parallel reading"
+description = "High-performance Rust library for moving structs to/from disk using Parquet format. Abstracts complex Arrow/Parquet usage while providing batch writing and parallel reading capabilities for maximum performance."
 license = "MIT"
 
 [lib]

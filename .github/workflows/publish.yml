@@ -14,18 +14,17 @@ jobs:
     - uses: actions/checkout@v4
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
-    - name: Run tests
-      run: |
-        cd src/parquet-record
-        cargo test --verbose
-    - name: Get crate version
+    - name: Get crate version first
       id: version
       run: |
-        VERSION=$(cd src/parquet-record && grep -E "^version = " Cargo.toml | head -n1 | cut -d '"' -f2)
+        VERSION=$(grep -E "^version = " src/parquet-record/Cargo.toml | head -n1 | cut -d '"' -f2)
         echo "current_version=$VERSION" >> $GITHUB_OUTPUT
         echo "Attempting to publish version: $VERSION"
+    - name: Run tests
+      working-directory: ./src/parquet-record
+      run: |
+        cargo test --verbose
     - name: Check for token
-      id: check_token
       run: |
         if [ "${{ secrets.CARGO_REGISTRY_TOKEN }}" != "" ]; then
           echo "has_token=true" >> $GITHUB_OUTPUT
@@ -33,13 +32,13 @@ jobs:
           echo "has_token=false" >> $GITHUB_OUTPUT
         fi
     - name: Login to crates.io
+      working-directory: ./src/parquet-record
       run: |
-        cd src/parquet-record
         cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
       if: steps.check_token.outputs.has_token == 'true'
     - name: Publish to crates.io
+      working-directory: ./src/parquet-record
       run: |
-        cd src/parquet-record
         cargo publish || echo "Publish failed - likely because this version was already published"
       if: steps.check_token.outputs.has_token == 'true'
     - name: Create Git tag
