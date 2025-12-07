@@ -16,7 +16,6 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
     - name: Get crate version first
       id: version
-      working-directory: ./src/parquet-record
       run: |
         VERSION=$(grep -E "^version = " Cargo.toml | head -n1 | cut -d '"' -f2)
         echo "current_version=$VERSION" >> $GITHUB_OUTPUT
