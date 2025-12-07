@@ -314,27 +314,17 @@ The library is designed around Arrow's memory layout for optimal performance:
 
 ## Release Process
 
-This library uses GitHub Actions to automate releases to crates.io:
+This library uses a simple GitHub Action to publish to crates.io:
 
-### Auto-bumping on merge (auto-bump.yml)
-- Automatically bumps version based on conventional commit messages when merging to main
-- `feat:` or `Feature:` commits trigger minor version bump
-- `fix:` or `Bugfix:` commits trigger patch version bump
-- `BREAKING CHANGE` or `!:` commits trigger major version bump
-- After bumping, automatically publishes to crates.io
-
-### Manual Publishing (publish.yml)
-- Automatically publishes to crates.io when the version in `Cargo.toml` changes
-- This happens when a new version tag is pushed to the main branch
-
-### Manual Version Bumping (bump-version.yml)
-- The `bump-version.yml` workflow allows manual version bumps with major/minor/patch options
-- This can be triggered manually via GitHub Actions UI
-- After running this workflow, the version is bumped, committed, published to crates.io, and tagged
+### Publishing (publish.yml)
+- Automatically publishes to crates.io when changes are pushed to the main branch
+- Checks the version in `Cargo.toml` and attempts to publish that version
+- Creates a Git tag for the published version
+- If the version already exists on crates.io, the publish will fail safely
 
 ### Requirements
 - Set up the `CARGO_REGISTRY_TOKEN` secret in GitHub repository settings
-- Version bumps are only published to crates.io when the workflow runs successfully
+- Manually update the version in `Cargo.toml` before merging to main to trigger a new release
 
 ## License
 
