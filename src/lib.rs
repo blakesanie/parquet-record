@@ -54,6 +54,14 @@ pub struct BatchBuffer<T: ParquetRecord> {
     pub items: Vec<T>,
 }
 
+impl<T: ParquetRecord> Default for BatchBuffer<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+        }
+    }
+}
+
 impl<T: ParquetRecord> BatchBuffer<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -286,12 +294,10 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
             return Ok(());
         }
 
-        let mut secondary_buffer = BatchBuffer::new(buffer_guard.items.len());
-        std::mem::swap(&mut *buffer_guard, &mut secondary_buffer);
-
+        let buffer_to_write = std::mem::take(&mut *buffer_guard);
         drop(buffer_guard);
 
-        self.write_buffer_to_disk(secondary_buffer)
+        self.write_buffer_to_disk(buffer_to_write)
     }
 
     /// Gets the number of items currently in the buffer
