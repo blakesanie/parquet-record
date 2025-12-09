@@ -69,7 +69,7 @@ fn test_full_workflow_integration() {
         IntegrationTestRecord { id: 3, name: "Charlie".to_string() },
     ];
     
-    writer.add_items(test_data.clone()).unwrap();
+    writer.add_items(&test_data.clone()).unwrap();
     writer.close().unwrap();
 
     // Read all records back

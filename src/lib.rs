@@ -110,7 +110,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
 
     /// Adds items to the buffer. If the buffer exceeds the specified size,
     /// it will be swapped with a secondary buffer and written to disk on the same thread.
-    pub fn add_items(&self, items: Vec<T>) -> Result<(), io::Error> {
+    pub fn add_items(&self, items: &[T]) -> Result<(), io::Error> {
         let closed_guard = self.closed.read().unwrap();
         if *closed_guard {
             return Err(io::Error::other("already closed"));
@@ -120,7 +120,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
                 .buffer
                 .lock()
                 .map_err(|_| io::Error::other("Buffer lock poisoned"))?;
-            buffer_guard.items.extend(items);
+            buffer_guard.items.extend_from_slice(items);
             Ok(())
         } else {
             let mut remaining_items = items;
@@ -144,7 +144,7 @@ impl<T: ParquetRecord + Clone> ParquetBatchWriter<T> {
                 let take_count = std::cmp::min(available_space, remaining_items.len());
                 let (items_to_add, remaining) = remaining_items.split_at(take_count);
                 buffer_guard.items.extend_from_slice(items_to_add);
-                remaining_items = remaining.to_vec();
+                remaining_items = remaining;
 
                 if buffer_guard.items.len() >= self.buffer_size {
                     let mut secondary_buffer = BatchBuffer::new(self.buffer_size);

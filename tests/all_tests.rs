@@ -75,7 +75,7 @@ fn test_parquet_batch_writer() {
     ];
 
     // Add items to writer (this triggers file creation)
-    writer.add_items(test_items).unwrap();
+    writer.add_items(&test_items).unwrap();
 
     // Close the writer to finalize the file
     writer.close().unwrap();
@@ -111,7 +111,7 @@ fn test_mb_logging() {
         },
     ];
 
-    writer.add_items(test_items).unwrap();
+    writer.add_items(&test_items).unwrap();
     writer.close().unwrap();
 
     // Clean up test file
@@ -129,7 +129,7 @@ fn test_read_parquet_columns_par() {
         TestRecord { id: 2, value: "b".to_string() },
         TestRecord { id: 3, value: "c".to_string() },
     ];
-    writer.add_items(items).unwrap();
+    writer.add_items(&items).unwrap();
     writer.close().unwrap();
 
     // Read only the "id" column in parallel
@@ -162,7 +162,7 @@ fn test_all_functions_comprehensive() {
 
     // Test ParquetBatchWriter functionality
     let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
-    writer.add_items(test_items.clone()).unwrap();
+    writer.add_items(&test_items.clone()).unwrap();
     writer.flush().unwrap();  // Ensure all items are written to update stats properly
 
     // Get writer stats before closing
@@ -271,7 +271,7 @@ fn test_buffer_operations() {
         TestRecord { id: 6, value: "item6".to_string() },
         TestRecord { id: 7, value: "item7".to_string() },
     ];
-    writer.add_items(more_items).unwrap();
+    writer.add_items(&more_items).unwrap();
 
     // Get the buffer length before closing
     let buffer_len_before_close = writer.buffer_len();
@@ -341,7 +341,7 @@ fn test_write_stats() {
         TestRecord { id: 4, value: "four".to_string() },
     ];
 
-    writer.add_items(items).unwrap();
+    writer.add_items(&items).unwrap();
     writer.flush().unwrap();  // Ensure all items in buffer are written
     let stats = writer.get_stats().unwrap();
     writer.close().unwrap();
@@ -406,7 +406,7 @@ fn test_verbose_logging_functionality() {
         TestRecord { id: 2, value: "verbose2".to_string() },
     ];
 
-    writer.add_items(items).unwrap();
+    writer.add_items(&items).unwrap();
     writer.close().unwrap();
 
     // Verify items were written
@@ -436,7 +436,7 @@ fn test_read_parquet_sequential() {
     ];
 
     let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(2));
-    writer.add_items(items.clone()).unwrap();
+    writer.add_items(&items.clone()).unwrap();
     writer.close().unwrap();
 
     // Test read_parquet with different batch sizes
@@ -492,7 +492,7 @@ fn test_read_parquet_parallel() {
     }).collect();
 
     let writer = ParquetBatchWriter::<TestRecord>::new(path.to_string(), Some(5)); // Buffer size 5
-    writer.add_items(items.clone()).unwrap();
+    writer.add_items(&items.clone()).unwrap();
     writer.close().unwrap();
 
     // Test read_parquet_par - getting individual batches

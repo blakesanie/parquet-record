@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     // Add items to the writer
-    writer.add_items(people)?;
+    writer.add_items(&people)?;
 
     // Close the writer to finalize the file
     writer.close()?;

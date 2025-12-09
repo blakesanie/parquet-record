@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Add all items
-    writer.add_items(products)?;
+    writer.add_items(&products)?;
     writer.close()?;
 
     println!("Successfully wrote parallel_example.parquet with 200 products");
