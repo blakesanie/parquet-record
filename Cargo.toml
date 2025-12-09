@@ -1,6 +1,6 @@
 [package]
 name = "parquet-record"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Blake Sanie <blake@sanie.com>"]
 description = "High-performance Rust library for moving structs to/from disk using Parquet format. Abstracts complex Arrow/Parquet usage while providing batch writing and parallel reading capabilities for maximum performance."
